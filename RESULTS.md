@@ -166,4 +166,13 @@ Dev server, 4,400-expert RAM tier, 4 sequences, two samples per prompt:
 
 Greedy junk test 0/7 bad and recall exact at 2k, 8k and 25k on the final build.
 
-**Chunked NVMe reads, not adopted** (`scripts/read_bench.py`, real pack files, `O_DIRECT`): one 9.4 MB read takes 1.01 ms (9.3 GB/s). The same record as 2, 4 or 8 parallel chunks took 1.01–1.23 ms. With 4 records in flight the drive reaches about 10 GB/s, whether or not reads are chunked. Both 9100 PROs run at PCIe Gen5 x4.
+**Chunked NVMe reads, built and not adopted.** Both 9100 PROs run at PCIe Gen5 x4. `fio` (`O_DIRECT`, `io_uring`, real pack file):
+
+| Pattern | Throughput | Per-read completion, median |
+|---|---|---|
+| Whole 9.4 MB record, one in flight | 9.7 GB/s | 1.00 ms |
+| 4 × 2.35 MB in parallel | 10.9 GB/s | 0.85 ms per chunk |
+| 8 × 1.18 MB in parallel | 10.5 GB/s | 0.89 ms per chunk |
+| 4 whole records in flight | 11.9 GB/s | 3.13 ms |
+
+Chunks land together, so they offer no early prefix to copy, and only a lone read gains. `CSF_READ_CHUNKS=4` splits a request's demand read into parallel chunks only when it is that request's only NVMe read. In the dev A/B against whole reads it changed nothing beyond noise: code 86–92 vs 88–95 tok/s, prose 63–68 vs 65–70, 4 streams 91 vs 90, prefill 1,860–1,884 vs 1,848–1,946. The option stays off by default (`CSF_READ_CHUNKS=1`).

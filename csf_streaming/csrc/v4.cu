@@ -19,6 +19,7 @@
 #include <immintrin.h>
 
 #include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <atomic>
@@ -217,6 +218,7 @@ inline void vstore(long long* p, long long v) { *reinterpret_cast<volatile long 
 struct Buf {
   int layer = -1, expert = -1;
   int state = 0;                 // 0 empty, 1 loading, 2 ready
+  int pending = 0;               // reads still outstanding while loading
   bool prefetched = false;
   int lock_layer = -1;
   long long lock_seq = 0;
@@ -249,7 +251,8 @@ struct Layer {
   Stats st;
 };
 
-struct Job { int buf; int fd; long long offset; bool demand; };
+// One read into a host buffer: the whole record, or a byte range of it (chunked demand reads).
+struct Job { int buf; int fd; long long offset; bool demand; long long start = 0, len = -1; };
 
 class Service {
  public:
@@ -262,6 +265,7 @@ class Service {
   std::condition_variable cv, work;
   std::deque<Job> demand_q, prefetch_q;
   int prefetch_inflight = 0, prefetch_cap = 8;
+  int read_chunks = 1;           // CSF_READ_CHUNKS: chunks for a request's only demand read
   unsigned long long tick = 0;
   std::atomic<bool> stop{false};
   std::atomic<long long> error_layer{-1};
@@ -306,16 +310,17 @@ class Service {
         if (!demand_q.empty()) { job = demand_q.front(); demand_q.pop_front(); }
         else { job = prefetch_q.front(); prefetch_q.pop_front(); }
       }
-      char* dst = cache_base + static_cast<long long>(job.buf) * stride;
+      char* dst = cache_base + static_cast<long long>(job.buf) * stride + job.start;
+      const long long len = job.len < 0 ? stride : job.len;
       long long done = 0;
-      while (done < stride) {
-        ssize_t r = pread(job.fd, dst + done, stride - done, job.offset + done);
+      while (done < len) {
+        ssize_t r = pread(job.fd, dst + done, len - done, job.offset + job.start + done);
         if (r <= 0) { std::lock_guard<std::mutex> l(mu); fatal = "pack read failed"; break; }
         done += r;
       }
       {
         std::lock_guard<std::mutex> lock(mu);
-        bufs[job.buf].state = 2;
+        if (--bufs[job.buf].pending <= 0) bufs[job.buf].state = 2;
         if (!job.demand) prefetch_inflight--;
       }
       cv.notify_all();
@@ -395,6 +400,7 @@ class Service {
       // Sources: RAM tier, ready read-ahead buffer, in-flight read-ahead, or a demand read.
       sources.resize(fills.size(), 0);
       std::vector<int> used, buf_of(fills.size(), -1);
+      std::vector<Job> demand_jobs;
       {
         std::unique_lock<std::mutex> lock(mu);
         tick++;
@@ -412,9 +418,9 @@ class Service {
             while (b < 0) { cv.wait_for(lock, std::chrono::microseconds(50)); b = victim(); }
             bufs[b].layer = L.id; bufs[b].expert = e; bufs[b].state = 1;
             index[key(L.id, e)] = b;
-            demand_q.push_back(Job{b, L.fd, static_cast<long long>(e) * stride, true});
+            bufs[b].pending = 1;
+            demand_jobs.push_back(Job{b, L.fd, static_cast<long long>(e) * stride, true});
             L.st.fill_read++;
-            work.notify_one();
           }
           bufs[b].last_use = tick;
           bufs[b].lock_layer = L.id;     // lock now: later fills in this request must not evict it
@@ -423,6 +429,21 @@ class Service {
           buf_of[i] = b;
           sources[i] = reinterpret_cast<long long>(cache_base + static_cast<long long>(b) * stride);
         }
+        // A lone demand read is split into parallel chunks (CSF_READ_CHUNKS): one 9.4 MB read
+        // reaches ~9.7 GB/s, four parallel 2.35 MB chunks ~10.9 GB/s. Several reads in flight
+        // already keep the drive busy, so those stay whole.
+        if (demand_jobs.size() == 1 && read_chunks > 1) {
+          Job j = demand_jobs[0];
+          const long long piece = stride / read_chunks;
+          bufs[j.buf].pending = read_chunks;
+          demand_jobs.clear();
+          for (int c = 0; c < read_chunks; ++c) {
+            Job part = j; part.start = c * piece; part.len = piece;
+            demand_jobs.push_back(part);
+          }
+        }
+        for (const Job& j : demand_jobs) demand_q.push_back(j);
+        if (!demand_jobs.empty()) work.notify_all();
         // Ready fills first: the GPU copies them while the remaining reads are in flight.
         std::vector<size_t> order(fills.size());
         for (size_t i = 0; i < order.size(); ++i) order[i] = i;
@@ -478,6 +499,7 @@ class Service {
         bufs[b].layer = N.id; bufs[b].expert = e; bufs[b].state = 1; bufs[b].prefetched = true;
         bufs[b].last_use = ++tick;
         index[key(N.id, e)] = b;
+        bufs[b].pending = 1;
         prefetch_q.push_back(Job{b, N.fd, static_cast<long long>(e) * stride, false});
         prefetch_inflight++;
         N.st.prefetch_reads++;
@@ -549,6 +571,10 @@ void init(int64_t cache_ptr, int64_t cache_buffers, int64_t stride, int64_t read
   g->cache_base = reinterpret_cast<char*>(cache_ptr);
   g->bufs.resize(cache_buffers);
   g->prefetch_cap = static_cast<int>(prefetch_cap);
+  if (const char* c = std::getenv("CSF_READ_CHUNKS")) g->read_chunks = std::max(1, std::atoi(c));
+  // Each chunk must stay 4 KiB aligned for O_DIRECT.
+  TORCH_CHECK((stride / 4096) % g->read_chunks == 0 && stride % 4096 == 0,
+              "CSF_READ_CHUNKS must split the record into 4 KiB-aligned pieces");
   for (int i = 0; i < readers; ++i) g->readers.emplace_back([] { g->reader_loop(); });
 }
 
