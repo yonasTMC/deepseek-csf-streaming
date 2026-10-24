@@ -1,5 +1,7 @@
 # CSF expert streaming for DeepSeek-V4.1-Flash on 2× RTX PRO 6000
 
+This project is based on DeepSeek-V4.1-Flash-1017-lossless-CSF by Local Inference Lab, Inc., a non-profit organization, available at [https://huggingface.co/local-inference-lab/DeepSeek-V4.1-Flash-1017-lossless-CSF](https://huggingface.co/local-inference-lab/DeepSeek-V4.1-Flash-1017-lossless-CSF). DeepSeek-V4.1-Flash-1017-lossless-CSF is licensed under the Local Inference Lab License, Version 1.0.
+
 A vLLM plugin that serves **DeepSeek-V4.1-Flash-1017** (the lossless-CSF checkpoint, about 460 GB with
 Engram tables) on **one machine with two 96 GB RTX PRO 6000 Blackwell GPUs, 124 GiB of RAM and two NVMe
 drives**. That is far less memory than the model. The routed experts do not fit in VRAM or RAM, so the
@@ -73,7 +75,9 @@ See [RESULTS.md](RESULTS.md) for every measurement and how it was taken, and [do
 
 The machine needs 2× 96 GB Blackwell GPUs, about 124 GiB of RAM with nothing else heavy running, and two NVMe drives with about 150 GB free each for the pack. The engine pins about 77 GiB of host RAM.
 
-**1. Build the split expert pack.** This takes about 8 minutes and writes about 150 GB to each drive. Run it inside the image (see `scripts/devctl.sh`):
+**0. Get the checkpoint** from its original location and accept its license there. This repository does not include it.
+
+**1. Build the split expert pack.** This takes about 8 minutes and writes about 150 GB to each drive. Run it inside the image (see `scripts/devctl.sh`). The pack re-encodes the checkpoint's weights, so keep it on machines you control; the Local Inference Lab License forbids re-uploading it.
 
 ```bash
 python -m torch.distributed.run --nproc-per-node=2 scripts/pack_experts.py \
@@ -105,9 +109,13 @@ PACK_DIRS=/pack/nvme1/split:/pack/nvme2/split PLACEMENT=placement-learned-202610
 
 The server records routing ids (no text) to `CSF_V4_TRACE` when it is set; `learn_placement.py` reads those files.
 
-## Credits
+## License and credits
 
-- **Serving stack:** the [Local Inference Lab](https://docker.local-inference-lab.ai) vLLM image, with B12X kernels and DSpark.
-- **Chat encoder:** DeepSeek's 1017 encoder (MIT).
-- **Model:** DeepSeek-V4.1-Flash-1017, here the abliterated lossless-CSF checkpoint published by `jcartu`.
+- **This repository's code:** [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attributions.
+- **Model:** [DeepSeek-V4.1-Flash-1017-lossless-CSF](https://huggingface.co/local-inference-lab/DeepSeek-V4.1-Flash-1017-lossless-CSF) by Local Inference Lab, Inc., under the Local Inference Lab License 1.0, which is not included here.
+  - Development used the abliterated derivative [`jcartu/DeepSeek-V4.1-Flash-1017-abliterated-lossless-CSF`](https://huggingface.co/jcartu/DeepSeek-V4.1-Flash-1017-abliterated-lossless-CSF).
+  - Both are made from [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), which is under MIT.
+  - The checkpoint and the expert packs built from it must not be redistributed.
+- **Serving stack:** the [Local Inference Lab](https://docker.local-inference-lab.ai) vLLM image. Its vLLM, B12X kernels, FlashInfer and DSpark components are under their own licenses, Apache-2.0 for the open-source parts. This repository extends that image and does not include it.
+- **Chat encoder:** `vendor/deepseek_v41_encoding_1017.py` is DeepSeek's 1017 encoder, copied unchanged, Copyright (c) 2023 DeepSeek, under the MIT License ([LICENSES/MIT-DeepSeek.txt](LICENSES/MIT-DeepSeek.txt)).
 - **Prior art:** [RESEARCH.md](RESEARCH.md) surveys the prior work this design draws on (snapshot from 2026-10-23).

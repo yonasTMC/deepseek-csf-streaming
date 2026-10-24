@@ -1,0 +1,55 @@
+CSF expert streaming for DeepSeek-V4.1-Flash
+Copyright 2026 Yonas Meshesha
+
+The code in this repository is licensed under the Apache License, Version 2.0
+(see LICENSE), except where a file or the list below states otherwise.
+
+-------------------------------------------------------------------------------
+Model checkpoint (not included in this repository)
+-------------------------------------------------------------------------------
+
+This project is based on DeepSeek-V4.1-Flash-1017-lossless-CSF by Local
+Inference Lab, Inc., a non-profit organization, available at
+https://huggingface.co/local-inference-lab/DeepSeek-V4.1-Flash-1017-lossless-CSF.
+DeepSeek-V4.1-Flash-1017-lossless-CSF is licensed under the Local Inference
+Lab License, Version 1.0.
+
+The engine was developed and measured with the derivative
+jcartu/DeepSeek-V4.1-Flash-1017-abliterated-lossless-CSF, which is distributed
+under the same license for its CSF container. Both are made from
+deepseek-ai/DeepSeek-V4.1-Flash-1017 (revision
+1bae0e1088993b9b82de08f59de5be5a34e42170), licensed under the MIT License.
+
+This repository does not contain, and must not be used to distribute, the
+checkpoint or any copy derived from its parameters. That includes the expert
+packs built by scripts/pack_experts.py, which re-encode the checkpoint's
+weights: keep them on machines you control (Local Inference Lab License,
+Section 2). Download the checkpoint from its original location and accept its
+license there.
+
+-------------------------------------------------------------------------------
+Third-party material included in this repository
+-------------------------------------------------------------------------------
+
+vendor/deepseek_v41_encoding_1017.py
+    DeepSeek-V4.1 chat encoder, copied unchanged from
+    deepseek-ai/DeepSeek-V4.1-Flash-1017 (revision
+    1bae0e1088993b9b82de08f59de5be5a34e42170), encoding/encoding.py,
+    SHA-256 13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2.
+    Copyright (c) 2023 DeepSeek. MIT License; see LICENSES/MIT-DeepSeek.txt.
+
+patches/deepseek_v41_images.py
+    Contains short excerpts of vLLM source text (vllm/tokenizers/deepseek_v41.py,
+    Local Inference Lab build), used to locate and modify that file when the
+    image is built. vLLM is licensed under the Apache License, Version 2.0.
+
+-------------------------------------------------------------------------------
+Software this project builds on (not included in this repository)
+-------------------------------------------------------------------------------
+
+The Dockerfile builds on the Local Inference Lab vLLM image
+(ghcr.io/local-inference-lab/vllm), which provides the serving stack this
+plugin extends: vLLM (Apache-2.0), the B12X kernels (Apache-2.0), FlashInfer
+(Apache-2.0), DSpark speculative decoding, and NVIDIA CUDA components under
+NVIDIA's own licenses. Their licenses apply to the image and to anything built
+from it.
