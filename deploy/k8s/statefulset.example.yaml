@@ -113,7 +113,7 @@ spec:
         - name: VLLM_ENABLE_PCIE_ALLREDUCE
           value: '1'
         - name: VLLM_DISABLE_SHARED_EXPERTS_STREAM
-          value: '1'
+          value: '0'  # shared experts on a side stream overlap the routed-expert fills
         - name: B12X_W4A8_CSF_INLINE
           value: '0'
         - name: B12X_AUTOTUNE
@@ -134,7 +134,7 @@ spec:
         - name: CSF_PACK_DIRS
           value: /pack/nvme1/split:/pack/nvme2/split  # built by scripts/pack_experts.py --split 2
         - name: CSF_PLACEMENT
-          value: /placement/placement-learned-20261024.json  # evidence/; relearn from your traces with scripts/learn_placement.py
+          value: /placement/placement-layered-miss-20261024.json  # evidence/; relearn from your traces (scripts/layer_budget.py, learn_placement.py --ram-by misses)
         - name: CSF_RAM_EXPERTS
           value: '4400'  # ~77 GiB of pinned host RAM across both ranks
         - name: CSF_HOST_CACHE

@@ -3,9 +3,9 @@
 A chronological log of measurements on the target machine: 2× RTX PRO 6000 Blackwell (96 GB), 124 GiB of RAM, 2× Samsung 9100 PRO. Each section states its configuration. Later sections supersede earlier ones.
 
 **Current state (2026-10-24):**
-- **Configuration:** split pack, deterministic kernel, compacted prefill, progressive fill acknowledgement, per-layer slot counts learned from traffic, 4,400-expert RAM tier, 4 sequences.
-- **Decode:** 88–95 tok/s on code, 76–77 in thinking mode, 65–70 on prose; 4 concurrent streams total about 92 tok/s.
-- **Prefill:** about 1,810 tok/s on real 50k-token code prompts.
+- **Configuration:** split pack, deterministic kernel, compacted prefill, progressive fill acknowledgement, per-layer slot counts and a post-LRU-ranked RAM tier learned from traffic, 4,400-expert RAM tier, shared-expert side stream, 4 sequences.
+- **Decode:** 94–102 tok/s on code, 84–88 in thinking mode, 69–78 on prose; 4 concurrent streams total about 97 tok/s.
+- **Prefill:** about 1,900 tok/s on real 50k-token code prompts.
 - **Recall:** passphrase recall exact at 2k, 8k and 25k tokens.
 
 ## v1 baseline — 2026-10-23
@@ -176,3 +176,23 @@ Greedy junk test 0/7 bad and recall exact at 2k, 8k and 25k on the final build.
 | 4 whole records in flight | 11.9 GB/s | 3.13 ms |
 
 Chunks land together, so they offer no early prefix to copy, and only a lone read gains. `CSF_READ_CHUNKS=4` splits a request's demand read into parallel chunks only when it is that request's only NVMe read. In the dev A/B against whole reads it changed nothing beyond noise: code 86–92 vs 88–95 tok/s, prose 63–68 vs 65–70, 4 streams 91 vs 90, prefill 1,860–1,884 vs 1,848–1,946. The option stays off by default (`CSF_READ_CHUNKS=1`).
+
+## Post-LRU RAM tier and shared-expert stream — 2026-10-24
+
+`learn_placement.py --ram-by misses` ranks the RAM tier by how often each expert still misses after the pinned set and the LRU, replayed over the training traces, instead of by raw frequency. On held-out traffic with the per-layer placement, NVMe loads per decode step fell from 15.8 to 13.6, and RAM-tier loads rose from 27.3 to 29.5 (`evidence/placement-layered-miss-20261024.json`).
+
+`VLLM_DISABLE_SHARED_EXPERTS_STREAM=0` runs shared experts on vLLM's side stream, overlapping the routed-expert fills.
+
+| | Before | Post-LRU RAM tier | + shared-expert stream | Production after |
+|---|---|---|---|---|
+| Code | 88–95 tok/s | 91–99 | 94–103 | 94–102 |
+| Prose | 65–70 | 67–73 | 69–77 | 69–78 |
+| Thinking (T=1) | 75 | 76–81 | 81–87 | 84–88 |
+| 4 streams total | 90 | 99.5 | 97.7 | 97 |
+| Prefill, real code, about 50k tokens | 1,848–1,946 | 1,897–1,954 | 1,905–1,985 | 1,901 |
+
+Greedy junk test 0/6 bad and recall exact at 2k, 8k and 25k with the shared-expert stream.
+
+**Rejected after an offline test:** prefetching later layers' NVMe-class experts from co-occurrence with layers 0–1 of the same step (`scripts/cooccur_eval.py`). At 19% recall the precision is 17%; at 41% precision the recall is 1%.
+
+**Hardware note:** the test machine has 2 of its 8 DDR5 slots populated (2 × 64 GiB, 5600 MT/s), so host memory bandwidth, about 90 GB/s in theory, is shared by both GPUs' fills (about 46 GB/s each) and the NVMe writes. All 8 channels would give about 4× the bandwidth, and 512 GiB would hold every routed expert of both ranks (about 289 GB). That has not been measured.
