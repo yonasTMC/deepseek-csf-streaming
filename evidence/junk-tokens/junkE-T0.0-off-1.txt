@@ -1,0 +1,475 @@
+=== REASONING
+
+=== CONTENT
+```python
+#!/usr/bin/env python3
+"""Aggregate per-endpoint latency percentiles from a JSON lines log file.
+
+Each line in the input file is expected to be a JSON object with at least
+the following keys:
+
+    {"endpoint": "/api/users", "latency_ms": 42.5, ...}
+
+The script groups records by endpoint, computes p50/p90/p95/p99 latency
+percentiles (plus count/min/max/mean), and prints a formatted table.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from dataclasses import dataclass, field
+from typing import Iterable, Iterator, Sequence
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EndpointStats:
+    """Aggregated latency statistics for a single endpoint."""
+
+    endpoint: str
+    latencies: list[float] = field(default_factory=list)
+
+    def add(self, latency_ms: float) -> None:
+        self.latencies.append(latency_ms)
+
+    @property
+    def count(self) -> int:
+        return len(self.latencies)
+
+    @property
+    def minimum(self) -> float:
+        return min(self.latencies)
+
+    @property
+    def maximum(self) -> float:
+        return max(self.latencies)
+
+    @property
+    def mean(self) -> float:
+        return sum(self.latencies) / len(self.latencies)
+
+    def percentile(self, p: float) -> float:
+        """Return the p-th percentile (0 <= p <= 100) using linear interpolation.
+
+        Uses the same "inclusive" method as numpy.percentile's default
+        (linear interpolation between closest ranks).
+        """
+        if not 0.0 <= p <= 100.0:
+            raise ValueError(f"percentile must be in [0, 100], got {p}")
+        if not self.latencies:
+            raise ValueError("cannot compute percentile of empty sample")
+
+        ordered = sorted(self.latencies)
+        if len(ordered) == 1:
+            return ordered[0]
+
+        rank = (p / 100.0) * (len(ordered) - 1)
+        lower = math.floor(rank)
+        upper = math.ceil(rank)
+        if lower == upper:
+            return ordered[int(rank)]
+        weight = rank - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+
+class LogParseError(ValueError):
+    """Raised when a log line cannot be parsed into a record."""
+
+
+def parse_line(line: str, line_number: int | None = None) -> tuple[str, float]:
+    """Parse a single JSON line into ``(endpoint, latency_ms)``.
+
+    Raises :class:`LogParseError` on malformed input.
+    """
+    stripped = line.strip()
+    if not stripped:
+        raise LogParseError("empty line")
+
+    try:
+        record = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        where = f" (line {line_number})" if line_number is not None else ""
+        raise LogParseError(f"invalid JSON{where}: {exc}") from exc
+
+    if not isinstance(record, dict):
+        raise LogParseError(f"expected JSON object, got {type(record).__name__}")
+
+    endpoint = record.get("endpoint")
+    if not isinstance(endpoint, str) or not endpoint:
+        raise LogParseError("missing or invalid 'endpoint' field")
+
+    latency = record.get("latency_ms")
+    if isinstance(latency, bool) or not isinstance(latency, (int, float)):
+        raise LogParseError("missing or invalid 'latency_ms' field")
+    if latency < 0:
+        raise LogParseError(f"negative latency_ms: {latency}")
+
+    return endpoint, float(latency)
+
+
+def iter_records(lines: Iterable[str]) -> Iterator[tuple[str, float]]:
+    """Yield ``(endpoint, latency_ms)`` for each valid line, skipping bad ones."""
+    for lineno, line in enumerate(lines, start=1):
+        try:
+            yield parse_line(line, lineno)
+        except LogParseError as exc:
+            print(f"warning: skipping line {lineno}: {exc}", file=sys.stderr)
+
+
+def aggregate(records: Iterable[tuple[str, float]]) -> dict[str, EndpointStats]:
+    """Group records by endpoint and accumulate latencies."""
+    stats: dict[str, EndpointStats] = {}
+    for endpoint, latency in records:
+        bucket = stats.get(endpoint)
+        if bucket is None:
+            bucket = stats[endpoint] = EndpointStats(endpoint)
+        bucket.add(latency)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+COLUMNS: Sequence[tuple[str, str, str]] = (
+    # (header, format spec, attribute-or-percentile)
+    ("Endpoint", "<30", "endpoint"),
+    ("Count", ">7", "count"),
+    ("Min", ">9", "min"),
+    ("Mean", ">9", "mean"),
+    ("p50", ">9", "p50"),
+    ("p90", ">9", "p90"),
+    ("p95", ">9", "p95"),
+    ("p99", ">9", "p99"),
+    ("Max", ">9", "max"),
+)
+
+
+def _format_value(stats: EndpointStats, key: str) -> str:
+    if key == "endpoint":
+        return stats.endpoint
+    if key == "count":
+        return str(stats.count)
+    if key == "min":
+        return f"{stats.minimum:.2f}"
+    if key == "max":
+        return f"{stats.maximum:.2f}"
+    if key == "mean":
+        return f"{stats.mean:.2f}"
+    if key.startswith("p"):
+        return f"{stats.percentile(float(key[1:])):.2f}"
+    raise KeyError(key)
+
+
+def render_table(stats: dict[str, EndpointStats]) -> str:
+    """Render the aggregated stats as a plain-text table."""
+    if not stats:
+        return "(no records)\n"
+
+    header = "  ".join(f"{name:{spec}}" for name, spec, _ in COLUMNS)
+    separator = "  ".join("-" * len(name) for name, _, _ in COLUMNS)
+    lines = [header, separator]
+
+    for endpoint in sorted(stats):
+        bucket = stats[endpoint]
+        row = "  ".join(
+            f"{_format_value(bucket, key):{spec}}" for _, spec, key in COLUMNS
+        )
+        lines.append(row)
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Aggregate per-endpoint latency percentiles from a JSON lines "
+            "log file and print a table."
+        ),
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default="-",
+        help="path to the JSON lines log file (default: stdin)",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=("endpoint", "count", "p99"),
+        default="endpoint",
+        help="row ordering (default: endpoint)",
+    )
+    return parser
+
+
+def _open_input(path: str):
+    if path == "-":
+        return sys.stdin
+    return open(path, "r", encoding="utf-8")
+
+
+def _sort_stats(
+    stats: dict[str, EndpointStats], key: str
+) -> dict[str, EndpointStats]:
+    if key == "endpoint":
+        return dict(sorted(stats.items()))
+    if key == "count":
+        return dict(sorted(stats.items(), key=lambda kv: (-kv[1].count, kv[0])))
+    if key == "p99":
+        return dict(
+            sorted(
+                stats.items(),
+                key=lambda kv: (-kv[1].percentile(99.0), kv[0]),
+            )
+        )
+    raise ValueError(f"unknown sort key: {key}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    try:
+        stream = _open_input(args.path)
+    except OSError as exc:
+        print(f"error: cannot open {args.path!r}: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        stats = aggregate(iter_records(stream))
+    finally:
+        if stream is not sys.stdin:
+            stream.close()
+
+    if not stats:
+        print("(no records)", file=sys.stderr)
+        return 0
+
+    sys.stdout.write(render_table(_sort_stats(stats, args.sort)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+```python
+#!/usr/bin/env python3
+"""Tests for the latency aggregation script."""
+
+from __future__ import annotations
+
+import io
+import json
+import math
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+
+import latency_report as lr
+
+
+def _make_lines(records):
+    return [json.dumps(r) + "\n" for r in records]
+
+
+class ParseLineTests(unittest.TestCase):
+    def test_valid_record(self):
+        endpoint, latency = lr.parse_line('{"endpoint": "/a", "latency_ms": 12.5}')
+        self.assertEqual(endpoint, "/a")
+        self.assertEqual(latency, 12.5)
+
+    def test_integer_latency_is_coerced_to_float(self):
+        _, latency = lr.parse_line('{"endpoint": "/a", "latency_ms": 7}')
+        self.assertIsInstance(latency, float)
+        self.assertEqual(latency, 7.0)
+
+    def test_missing_endpoint(self):
+        with self.assertRaises(lr.LogParseError):
+            lr.parse_line('{"latency_ms": 1}')
+
+    def test_missing_latency(self):
+        with self.assertRaises(lr.LogParseError):
+            lr.parse_line('{"endpoint": "/a"}')
+
+    def test_bool_latency_rejected(self):
+        with self.assertRaises(lr.LogParseError):
+            lr.parse_line('{"endpoint": "/a", "latency_ms": true}')
+
+    def test_negative_latency_rejected(self):
+        with self.assertRaises(lr.LogParseError):
+            lr.parse_line('{"endpoint": "/a", "latency_ms": -1}')
+
+    def test_invalid_json(self):
+        with self.assertRaises(lr.LogParseError):
+            lr.parse_line("not json")
+
+    def test_non_object_json(self):
+        with self.assertRaises(lr.LogParseError):
+            lr.parse_line("[1, 2, 3]")
+
+    def test_empty_line(self):
+        with self.assertRaises(lr.LogParseError):
+            lr.parse_line("   \n")
+
+
+class IterRecordsTests(unittest.TestCase):
+    def test_skips_bad_lines_and_warns(self):
+        lines = [
+            '{"endpoint": "/a", "latency_ms": 1}\n',
+            "garbage\n",
+            '{"endpoint": "/b", "latency_ms": 2}\n',
+        ]
+        err = io.StringIO()
+        with redirect_stderr(err):
+            records = list(lr.iter_records(lines))
+        self.assertEqual(records, [("/a", 1.0), ("/b", 2.0)])
+        self.assertIn("line 2", err.getvalue())
+
+
+class PercentileTests(unittest.TestCase):
+    def _stats(self, values):
+        s = lr.EndpointStats("/x")
+        for v in values:
+            s.add(v)
+        return s
+
+    def test_single_value(self):
+        s = self._stats([5.0])
+        for p in (0, 50, 99, 100):
+            self.assertEqual(s.percentile(p), 5.0)
+
+    def test_known_values(self):
+        # 1..10 inclusive; numpy-style linear interpolation.
+        s = self._stats([float(i) for i in range(1, 11)])
+        self.assertAlmostEqual(s.percentile(0), 1.0)
+        self.assertAlmostEqual(s.percentile(50), 5.5)
+        self.assertAlmostEqual(s.percentile(90), 9.1)
+        self.assertAlmostEqual(s.percentile(100), 10.0)
+
+    def test_out_of_range(self):
+        s = self._stats([1.0, 2.0])
+        with self.assertRaises(ValueError):
+            s.percentile(-1)
+        with self.assertRaises(ValueError):
+            s.percentile(101)
+
+    def test_summary_stats(self):
+        s = self._stats([1.0, 2.0, 3.0, 4.0])
+        self.assertEqual(s.count, 4)
+        self.assertEqual(s.minimum, 1.0)
+        self.assertEqual(s.maximum, 4.0)
+        self.assertAlmostEqual(s.mean, 2.5)
+
+
+class AggregateTests(unittest.TestCase):
+    def test_groups_by_endpoint(self):
+        records = [("/a", 1.0), ("/b", 2.0), ("/a", 3.0)]
+        stats = lr.aggregate(records)
+        self.assertEqual(set(stats), {"/a", "/b"})
+        self.assertEqual(stats["/a"].count, 2)
+        self.assertEqual(stats["/b"].count, 1)
+
+
+class RenderTableTests(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(lr.render_table({}), "(no records)\n")
+
+    def test_contains_headers_and_rows(self):
+        stats = lr.aggregate([("/a", 1.0), ("/a", 3.0), ("/b", 2.0)])
+        out = lr.render_table(stats)
+        self.assertIn("Endpoint", out)
+        self.assertIn("p99", out)
+        self.assertIn("/a", out)
+        self.assertIn("/b", out)
+        # /a should be listed before /b (sorted by endpoint).
+        self.assertLess(out.index("/a"), out.index("/b"))
+
+
+class SortTests(unittest.TestCase):
+    def setUp(self):
+        self.stats = lr.aggregate(
+            [("/slow", 100.0), ("/fast", 1.0), ("/fast", 2.0), ("/mid", 50.0)]
+        )
+
+    def test_sort_by_endpoint(self):
+        ordered = list(lr._sort_stats(self.stats, "endpoint"))
+        self.assertEqual(ordered, ["/fast", "/mid", "/slow"])
+
+    def test_sort_by_count(self):
+        ordered = list(lr._sort_stats(self.stats, "count"))
+        self.assertEqual(ordered[0], "/fast")
+
+    def test_sort_by_p99(self):
+        ordered = list(lr._sort_stats(self.stats, "p99"))
+        self.assertEqual(ordered, ["/slow", "/mid", "/fast"])
+
+
+class MainTests(unittest.TestCase):
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = lr.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_end_to_end_from_file(self):
+        import tempfile, os
+
+        records = [
+            {"endpoint": "/a", "latency_ms": 10},
+            {"endpoint": "/a", "latency_ms": 20},
+            {"endpoint": "/b", "latency_ms": 5},
+        ]
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as fh:
+            for r in records:
+                fh.write(json.dumps(r) + "\n")
+            path = fh.name
+        try:
+            code, out, err = self._run([path])
+        finally:
+            os.unlink(path)
+
+        self.assertEqual(code, 0)
+        self.assertIn("/a", out)
+        self.assertIn("/b", out)
+        self.assertEqual(err, "")
+
+    def test_missing_file(self):
+        code, out, err = self._run(["/nonexistent/path.jsonl"])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot open", err)
+
+    def test_empty_input(self):
+        import tempfile, os
+
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            path = fh.name
+        try:
+            code, out, err = self._run([path])
+        finally:
+            os.unlink(path)
+        self.assertEqual(code, 0)
+        self.assertIn("no records", err)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```

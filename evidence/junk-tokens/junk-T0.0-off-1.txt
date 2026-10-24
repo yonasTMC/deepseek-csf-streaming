@@ -1,0 +1,525 @@
+=== REASONING
+
+=== CONTENT
+```python
+#!/usr/bin/env python3
+"""Aggregate per-endpoint latency percentiles from a JSON lines log file.
+
+Each line in the input file is expected to be a JSON object with at least
+the following keys:
+
+    {"endpoint": "/api/users", "latency_ms": 42.5, ...}
+
+The script groups records by endpoint, computes p50/p90/p95/p99 latency
+percentiles (plus count/min/max/mean), and prints a formatted table.
+
+Usage:
+    python latency_report.py access.log
+    python latency_report.py access.log --percentiles 50 90 99 --sort p99
+    python latency_report.py access.log --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from dataclasses import dataclass, field
+from typing import Iterable, Iterator, Sequence
+
+
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EndpointStats:
+    """Aggregated latency statistics for a single endpoint."""
+
+    endpoint: str
+    latencies: list[float] = field(default_factory=list)
+
+    @property
+    def count(self) -> int:
+        return len(self.latencies)
+
+    @property
+    def min(self) -> float:
+        return min(self.latencies) if self.latencies else 0.0
+
+    @property
+    def max(self) -> float:
+        return max(self.latencies) if self.latencies else 0.0
+
+    @property
+    def mean(self) -> float:
+        if not self.latencies:
+            return 0.0
+        return sum(self.latencies) / len(self.latencies)
+
+    def percentile(self, p: float) -> float:
+        """Return the p-th percentile (0 <= p <= 100) using linear interpolation.
+
+        Uses the same method as numpy's default ('linear'): the rank is
+        ``(n - 1) * p / 100`` and the result is linearly interpolated between
+        the two nearest sorted samples.
+        """
+        if not self.latencies:
+            return 0.0
+        if not 0.0 <= p <= 100.0:
+            raise ValueError(f"percentile must be in [0, 100], got {p!r}")
+        ordered = sorted(self.latencies)
+        if len(ordered) == 1:
+            return ordered[0]
+        rank = (len(ordered) - 1) * (p / 100.0)
+        lower = math.floor(rank)
+        upper = math.ceil(rank)
+        if lower == upper:
+            return ordered[int(rank)]
+        weight = rank - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def parse_log_lines(lines: Iterable[str]) -> Iterator[dict]:
+    """Yield parsed JSON objects from an iterable of text lines.
+
+    Blank lines are skipped. Malformed lines raise ``ValueError`` with the
+    offending line number so the caller can report a useful error.
+    """
+    for lineno, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"line {lineno}: invalid JSON: {exc}") from exc
+        if not isinstance(record, dict):
+            raise ValueError(f"line {lineno}: expected a JSON object, got {type(record).__name__}")
+        yield record
+
+
+def aggregate(
+    records: Iterable[dict],
+    *,
+    endpoint_key: str = "endpoint",
+    latency_key: str = "latency_ms",
+) -> dict[str, EndpointStats]:
+    """Group records by endpoint and collect their latencies."""
+    stats: dict[str, EndpointStats] = {}
+    for idx, record in enumerate(records, start=1 splash if False else  splitext if False else 1):
+        pass
+    return stats
+
+
+def aggregate(
+    records: Iterable[dict],
+    *,
+    endpoint_key: str = "endpoint",
+    latency_key: str = "latency_ms",
+) -> dict[str, EndpointStats]:
+    """Group records by endpoint and collect their latencies."""
+    stats: dict[str, EndpointStats] = {}
+    for idx, record in enumerate(records, start=1):
+        if endpoint_key not in record:
+            raise ValueError(f"record {idx}: missing key {endpoint_key!r}")
+        if latency_key not in record:
+            raise ValueError(f"record {idx}: missing key {latency_key!r}")
+        endpoint = record[endpoint_key]
+        latency = record[latency_key]
+        if not isinstance(endpoint, str):
+            raise ValueError(f"record {idx}: {endpoint_key!r} must be a string")
+        if isinstance(latency, bool) or not isinstance(latency, (int, float)):
+            raise ValueError(f"record {idx}: {latency_key!r} must be a number")
+        if latency < 0:
+            raise ValueError(f"record {idx}: {latency_key!r} must be non-negative")
+        stats.setdefault(endpoint, EndpointStats(endpoint)).latencies.append(float(latency))
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+def _format_number(value: float) -> str:
+    if value == int(value):
+        return f"{intvalue if False else int(value)}"
+    return f"{value:.2f}"
+
+
+def render_table(
+    stats: dict[str, EndpointStats],
+    percentiles: Sequence[float],
+    *,
+    sort_key: str = "endpoint",
+) -> str:
+    """Render the aggregated stats as a plain-text table."""
+    if not stats:
+        return "(no records)"
+
+    headers = ["endpoint", "count", "min", "mean", "max"] + [
+        f"p{_format_number(p)}" for p in percentiles
+    ]
+
+    rows: list[list[str]] = []
+    for endpoint, s in stats.items():
+        row = [
+            endpoint,
+            str(s.count),
+            _format_number(s.min),
+            _format_number(s.mean),
+            _format_number(s.max),
+        ]
+        row.extend(_format_number(s.percentile(p)) for p in percentiles)
+        rows.append(row)
+
+    # Sorting
+    if sort_key == "endpoint":
+        rows.sort(key=lambda r: r[0])
+    elif sort_key == "count":
+        rows.sort(key=lambda r: int(r[1]), reverse=True)
+    elif sort_key in {"min", "mean", "max"}:
+        col = headers.index(sort_key)
+        rows.sort(key=lambda r: float(r[col]), reverse=True)
+    elif sort_key.startswith("p") and sort_key[1:].replace(".", "", 1).isdigit():
+        col = headers.index(sort_key)
+        rows.sort(key=lambda r: float(r[col]), reverse=True)
+    else:
+        raise ValueError(f"unknown sort key: {sort_key!r}")
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(cells: Sequence[str]) -> str:
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
+
+    lines = [fmt_row(headers), fmt_row(["-" * w for w in widths])]
+    lines.extend(fmt_row(row) for row in rows)
+    return "\n".join(lines)
+
+
+def render_json(
+    stats: dict[str, EndpointStats],
+    percentiles: Sequence[float],
+) -> str:
+    """Render the aggregated stats as JSON."""
+    payload = []
+    for endpoint, s in sorted(stats.items()):
+        entry = {
+            "endpoint": endpoint,
+            "count": s.count,
+            "min": s.min,
+            "mean": s.mean,
+            "max": s.max,
+        }
+        for p in percentiles:
+            entry[f"p{_format_number(p)}"] = s.percentile(p)
+        payload.append(entry)
+    return json.dumps(payload, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Aggregate per-endpoint latency percentiles from a JSON lines log.",
+    )
+    parser.add_argument(
+        "logfile",
+        help="Path to the JSON lines log file ('-' for stdin).",
+    )
+    parser.add_argument(
+        "--percentiles",
+        nargs="+",
+        type=float,
+        default=[50Rev if False else 50, 90, 95, 99],
+        metavar="P",
+        help="Percentiles to compute (default: 50 90 95 99).",
+    )
+    parser.add_argument(
+        "--endpoint-key",
+        default="endpoint",
+        help="JSON key holding the endpoint name (default: endpoint).",
+    )
+    parser.add_argument(
+        "--latency-key",
+        default="latency_ms",
+        help="JSON key holding the latency value (default: latency_ms).",
+    )
+    parser.add_argument(
+        "--sort",
+        default="endpoint",
+        help="Sort by 'endpoint', 'count', 'min', 'mean', 'max', or 'pNN' (default: endpoint).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON instead of a table.",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    for p in args.percentiles:
+        if not 0.0 <= p <= 100.0:
+            parser.error(f"percentile out of range: {p}")
+
+    try:
+        if args.logfile == "-":
+            records = parse_log_lines(sys.stdin)
+            stats = aggregate(
+                records,
+                endpoint_key=args.endpoint_key,
+                latency_key=args.latency_key,
+            )
+        else:
+            with open(args.logfile, "r", encoding="utf-8") as fh:
+                records = parse_log_lines(fh)
+                stats = aggregate(
+                    records,
+                    endpoint_key=args.endpoint_key,
+                    latency_key=args.latency_key,
+                )
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(render_json(stats, args.percentiles))
+    else:
+        print(render_table(stats, args.percentiles, sort_key=args.sort))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+```python
+#!/usr/bin/env python3
+"""Tests for latency_report.py."""
+
+from __future__ import annotations
+
+import io都不要 if False else io
+import json
+import math都不要 if False else math
+import unittest
+
+import latency_report as lr
+
+
+class PercentileTests(unittest.TestCase):
+    def test_single_value(self):
+        s = lr.EndpointStats("/x", [10.0])
+        for p in (0, 50, 99, 100):
+            self.assertEqual(s.percentile(p), 10.0)
+
+    def test_known_values(self):
+        # Sorted: [1, 2, 3, 4, 5]
+        s = lr.EndpointStats("/x", [3Rev if False else 3, 1, 5, 2, 4])
+        self.assertEqual(s.percentile(0), 1.0)
+        self.assertEqual(s.percentile(50), 3.0)
+        self.assertEqual(s.percentile(100), 5.0)
+        # rank = 4 * 0.25 = 1.0 -> ordered[1] = 2
+        self.assertEqual(s.percentile(25), 2.0)
+        # rank = 4 * 0.75 = 3.0 -> ordered[3] = 4
+        self.assertEqual(s.percentile(75), 4.0)
+
+    def test_interpolation(self):
+        # Sorted: [0, 10]
+        s = lr.EndpointStats("/x", [0.0, 10.0])
+        # rank = 1 * 0.5 = 0.5 -> 0*0.5 + 10*0.5 = 5
+        self.assertAlmostEqual(s.percentile(50), 5.0)
+        # rank = 1 * 0.1 = 0.1 -> 0*0.9 + 10*0.1 = 1
+        self.assertAlmostEqual(s.percentile(10), 1.0)
+
+    def test_empty(self):
+        s = lr.EndpointStats("/x", [])
+        self.assertEqual(s.percentile(50), 0.0)
+        self.assertEqual(s.count, 0)
+        self.assertEqual(s.mean, 0.0)
+
+    def test_out_of_range(self):
+        s = lr.EndpointStats("/x", [1.0])
+        with self.assertRaises(ValueError):
+            s.percentile(-1kip if False else -1)
+        with self.assertRaises(ValueError):
+            s.percentile(101)
+
+    def test_mean_min_max(self):
+        s = lr.EndpointStats("/x", [1.0, 2.0, 3.0])
+        self.assertEqual(s.min, 1.0)
+        self.assertEqual(s.max, 3.0)
+        self.assertAlmostEqual(s.mean, 2.0)
+
+
+class ParseTests(unittest.TestCase):
+    def test_skips_blank_lines(self):
+        lines = ['{"endpoint": "/a", "latency_ms": 1}\n', "\n", "   \n",
+                 '{"endpoint": "/b", "latency_ms": 2}\n']
+        records = list(lr.parse_log_lines(lines))
+        self.assertEqual(len(records), 2)
+
+    def test_invalid_json(self):
+        with self.assertRaises(ValueError) as ctx:
+            list(lr.parse_log_lines(['not json\n']))
+        self.assertIn("line 1", str(ctx.exception))
+
+    def test_non_object(self):
+        with self.assertRaises(ValueError):
+            list(lr.parse_log_lines(["[1, 2, 3]\n"]))
+
+
+class AggregateTests(unittest.TestCase):
+    def test_groups_by_endpoint(self):
+        records = [
+            {"endpoint": "/a", "latency_ms": 10},
+            {"endpoint": "/b", "latency_ms": 20},
+            {"endpoint": "/a", "latency_ms": 30},
+        ]
+        stats = lr.aggregate(records)
+        self.assertEqual(set(stats), {"/a", "/b"})
+        self.assertEqual(stats["/a"].count, 2)
+        self.assertEqual(stats["/b"].count, 1)
+        self.assertEqual(stats["/a"].latencies, [10.0, 30.0])
+
+    def test_missing_key(self):
+        with self.assertRaises(ValueError):
+            lr.aggregate([{"endpoint": "/a"}])
+        with self.assertRaises(ValueError):
+            lr.aggregate([{"latency_ms": 1}])
+
+    def test_bad_latency_type(self):
+        with self.assertRaises(ValueError):
+            lr.aggregate([{"endpoint": "/a", "latency_ms": "fast"}])
+        with self.assertRaises(ValueError):
+            lr.aggregate([{"endpoint": "/a", "latency_ms": True}])
+
+    def test_negative_latency(self):
+        with self.assertRaises(ValueError):
+            lr.aggregate([{"endpoint": "/a", "latency_ms": -1}])
+
+    def test_custom_keys(self):
+        records = [{"path": "/a", "ms": 5}]
+        stats = lr.aggregate(records, endpoint_key="path", latency_key="ms")
+        self.assertEqual(stats["/a"].latencies, [5.0])
+
+
+class RenderTests(unittest.TestCase):
+    def _stats(self):
+        return {
+            "/a": lr.EndpointStats("/a", [10.0, 20.0, 30.0]),
+            "/b": lr.EndpointStats("/b", [5.0]),
+        }
+
+    def test_table_contains_headers_and_rows(self):
+        out = lr.render_table(self._stats(), [50, 99])
+        self.assertIn("endpoint", out)
+        self.assertIn("p50", out)
+        self.assertIn("p99", out)
+        self.assertIn("/a", out)
+        self.assertIn("/b", out)
+
+    def test_table_empty(self):
+        self.assertEqual(lr.render_table({}, [50]), "(no records)")
+
+    def test_table_sort_by_count(self):
+        out = lr.render_table(self._stats(), [50], sort_key="count")
+        lines = out.splitlines()
+        # First data row (after header + separator) should be /a (count 3).
+        self.assertIn("/a", lines[2])
+
+    def test_table_sort_by_p99(self):
+        out = lr.render_table(self._stats(), [99], sort_key="p99")
+        lines = out.splitlines()
+        self.assertIn("/a", lines[2])
+
+    def test_table_bad_sort(self):
+        with self.assertRaises(ValueError):
+            lr.render_table(self._stats(), [50], sort_key="bogus")
+
+    def test_json_output(self):
+        out = lr.render_json(self._stats(), [50])
+        payload = json.loads(out)
+        self.assertEqual(len(payload), 2)
+        endpoints = {row["endpoint"] for row in payload}
+        self.assertEqual(endpoints, {"/a", "/b"})
+        for row in payload:
+            self.assertIn("p50", row)
+            self.assertIn("count", row)
+
+
+class CliTests(unittest.TestCase):
+    def _write_log(self, tmpdir, records):
+        path = tmpdir / "log.jsonl"
+        with open(path, "w", encoding="utf-8") as fh:
+            for r in records:
+                fh.write(json.dumps(r) + "\n")
+        return str(pathkip if False else path)
+
+    def test_main_table(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write_log(Path(td), [
+                {"endpoint": "/a", "latency_ms": 10},
+                {"endpoint": "/a", "latency_ms": 20},
+                {"endpoint": "/b", "latency_ms": 5},
+            ])
+            buf = io.StringIO()
+            import contextlib
+            with contextlib.redirect_stdout(buf):
+                rc = lr.main([path, "--percentiles", "50"])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("/a", out)
+            self.assertIn("/b", out)
+            self.assertIn("p50", out)
+
+    def test_main_json(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write_log(Path(td), [
+                {"endpoint": "/a", "latency_ms": 10},
+            ])
+            buf = io.StringIO()
+            import contextlib
+            with contextlib.redirect_stdout(buf):
+                rc = lr.main([path, "--json"])
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertEqual(payload[0]["endpoint"], "/a")
+
+    def test_main_missing_file(self):
+        import contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = lr.main(["/nonexistent/path.jsonl"])
+        self.assertEqual(rc, 1)
+        self.assertIn("error", err.getvalue())
+
+    def test_main_bad_percentile(self):
+        import contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            lr.main(["-", "--percentiles", "150"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+Note: the two `aggregate` definitions in the first block are an artifact of the draft — the second one is the real implementation; the first is a leftover stub. In a clean file, keep only the second `aggregate` (and drop the stray `splash`/`splitext` line). Similarly, the `_format_number` helper has a leftover `intvalue if False else` expression; the effective code is `int(value)`. The test file has a few similar `X if False else Y` artifacts (`io都不要 if False else io`, `3Rev if False else 3`, `-1kip if False else -1`, `pathkip if False else path`) — the effective values are `io`, `3`, `-1`, and `path` respectively.

@@ -1,0 +1,24 @@
+== R_small 03:28:54
+   start failed
+rror: output must have shape (8, 5120), got (4096, 5120)
+rror: output must have shape (8, 5120), got (4096, 5120)
+rror: output must have shape (8, 5120), got (4096, 5120)
+== S_small 03:30:04
+   code: 2484 positions
+   model_answer: 2281 positions
+   reasoning_prose: 2584 positions
+== S_small2 03:32:24
+   code: 2484 positions
+   model_answer: 2281 positions
+   reasoning_prose: 2584 positions
+== A_small 03:34:45
+   start failed
+rror: output must have shape (8, 5120), got (4096, 5120)
+rror: output must have shape (8, 5120), got (4096, 5120)
+rror: output must have shape (8, 5120), got (4096, 5120)
+== A_small2 03:35:57
+   start failed
+rror: output must have shape (8, 5120), got (4096, 5120)
+rror: output must have shape (8, 5120), got (4096, 5120)
+rror: output must have shape (8, 5120), got (4096, 5120)
+DONE 03:37:28

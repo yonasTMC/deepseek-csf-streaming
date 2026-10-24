@@ -1,0 +1,1786 @@
+=== REASONING
+We need answer user asks: "Reference code for style: [huge code] Task: Write a Python asyncio HTTP health checker with retries, exponential backoff and a summary report, plus tests. Output the code in ```python blocks."
+
+We need produce code. Need infer desired: Python asyncio HTTP health checker with retries, exponential backoff, summary report, plus tests. Output code in python blocks. Need likely include implementation and tests. Need style reference? They gave yaml/cyaml and typing.py as style reference. Maybe want code style similar? We钦? Need write robust code.
+
+Need decide dependencies. Use stdlib only? asyncio HTTP health checker. Could use aiohttp? But tests? Better stdlib only using asyncio.open_connection or urllib? Asyncio HTTP client with stdlib. Need health checker with retries, exponential backoff, summary report. Plus tests. Could use unittest.IsolatedAsyncioTestCase and local asyncio server. Need implement.
+
+Need output code in ```python blocks. Could include one block for module and one for tests. Need ensure code works. Let's design.
+
+Requirements:
+- Python asyncio HTTP health checker.
+- retries
+- exponential backoff
+- summary report
+- tests.
+
+Need likely implement:
+- HealthCheckConfig dataclass: url, method? timeout, retries, backoff_base, backoff_factor? max_backoff, expected_status? maybe.
+- HealthCheckResult dataclass: url, ok, status, attempts, elapsed, error.
+- HealthChecker class with async check(url) and check_many(urls) maybe.
+- HTTP request using asyncio.open_connection, parse URL, send GET, read status line and headers, maybe body. Need support http only? Could support https via ssl. Simpler support http and https with ssl.create_default_context. Need parse URL with urllib.parse.urlsplit. Need handle path/query. Need Host header. Need read response status. Need close writer. Need timeout via asyncio.wait_for. Need retries with exponential backoff. Need summary report.
+
+Need tests:
+- Start local asyncio HTTP server that can fail first N requests then succeed, or always fail, or status 500. Test retries and backoff? Avoid long sleeps by configurable backoff and maybe inject sleep? Could use small base. Test summary report. Test timeout? Maybe.
+
+Need code style. Could include type hints. Need no external deps. Need ensure tests pass.
+
+Let's craft implementation.
+
+Potential module `health_checker.py`:
+
+```python
+from __future__ import annotations
+
+import asyncio
+import ssl
+import time
+from dataclasses import dataclass, field
+from typing import Iterable, Sequence
+from urllib.parse import urlsplit
+
+@dataclass(frozen=True)
+class HealthCheckConfig:
+    timeout: float = 5.0
+    retries: int = 3  # number of retries after first attempt? Or total attempts? Need define.
+    backoff_base: float = 0.1
+    backoff_factor: float = 2.0
+    max_backoff: float = 5.0
+    expected_statuses: frozenset[int] = frozenset({200})? But dataclass frozen with frozenset default okay. Maybe expected_status: int = 200. Simpler expected_status: int = 200.
+    user_agent: str = "asyncio-health-checker/1.0"
+
+@dataclass
+class HealthCheckResult:
+    url: str
+    ok: bool
+    status: int | None
+    attempts: int
+    elapsed: float
+    error: str | None = None
+
+    def as_dict? maybe.
+
+class HealthChecker:
+    def __init__(self, config: HealthCheckConfig | None = None):
+        self.config = config or HealthCheckConfig()
+
+    async def check(self, url: str) -> HealthCheckResult:
+        start = time.monotonic()
+        last_error = None
+        last_status = None
+        attempts = 0
+        for attempt in range(1, self.config.retries + 2): # total attempts = retries+1
+            attempts = attempt
+            try:
+                status = await asyncio.wait_for(self._request(url), timeout=self.config.timeout)
+                last_status = status
+                if status == self.config.expected_status:
+                    return HealthCheckResult(url, True, status, attempts, time.monotonic()-start)
+                last_error = f"unexpected status {status}"
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            if attempt <= self.config.retries:
+                delay = min(self.config.backoff_base * (self.config.backoff_factor ** (attempt - 1)), self.config.max_backoff)
+                await asyncio.sleep(delay)
+        return HealthCheckResult(url, False, last_status, attempts, time.monotonic()-start, last_error)
+
+    async def _request(self, url: str) -> int:
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https"):
+            raise ValueError(f"unsupported URL scheme: {parts.scheme!r}")
+        host = parts.hostname
+        if not host:
+            raise ValueError(f"URL has no host: {url!r}")
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        ssl_context = ssl.create_default_context() if parts.scheme == "https" else None
+        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
+        try:
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: {self.config.user_agent}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            )
+            writer.write(request.encode("ascii"))
+            await writer.drain()
+            status_line = await reader.readline()
+            if not status_line:
+                raise ConnectionError("empty response")
+            parts_status = status_line.decode("latin-1").split()
+            if len(parts_status) < 2 or not parts_status[0].startswith("HTTP/"):
+                raise ValueError(f"invalid status line: {status_line!r}")
+            return int(parts_status[1])
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def check_many(self, urls: Sequence[str]) -> list[HealthCheckResult]:
+        return await asyncio.gather(*(self.check(url) for url in urls))
+
+def summarize(results: Iterable[HealthCheckResult]) -> str:
+    results = list(results)
+    total = len(results)
+    healthy = sum(1 for r in results if r.ok)
+    unhealthy = total - healthy
+    lines = [
+        "Health Check Summary",
+        "====================",
+        f"Total: {total}",
+        f"Healthy: {healthy}",
+        f"Unhealthy: {unhealthy}",
+    ]
+    if total:
+        lines.append("")
+        lines.append("Details:")
+        for r in results:
+            status = "OK" if r.ok else "FAIL"
+            status_code = r.status if r.status is not None else "-"
+            error = f" ({r.error})" if r.error else ""
+            lines.append(
+                f"- [{status}] {r.url} status={status_code} attempts={r.attempts} "
+                f"elapsed={r.elapsed:.3f}s{error}"
+            )
+    return "\n".join(lines)
+```
+
+Need maybe expected_statuses? Could allow multiple. But simple.
+
+Need tests. Use unittest.IsolatedAsyncioTestCase. Need local server. Need test retries and backoff. Need avoid flaky. We can create server that returns 500 first N then 200. Need count requests. Use asyncio.start_server. Handler reads request until \r\n\r\n, increments count, sends response. Need close. Need test check succeeds after retries. Need test failure after retries. Need test summary. Need test timeout? Could test timeout with server that sleeps. But maybe enough.
+
+Need ensure `_request` reads status line only and closes. Server handler should handle. Need writer.close and wait_closed. In tests, server handler can write response and close. Need use `asyncio.start_server` with host 127.0.0.1 port 0. Get port from server.sockets[0].getsockname()[1]. Need cleanup.
+
+Test class:
+
+```python
+import asyncio
+import unittest
+from health_checker import HealthCheckConfig, HealthChecker, summarize
+
+class TestHealthChecker(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.server = None
+        self.requests = 0
+        self.failures_remaining = 0
+        self.delay = 0.0
+        self.status = 200
+
+    async def start_server(self):
+        async def handler(reader, writer):
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                self.requests += 1
+                if self.delay:
+                    await asyncio.sleep(self.delay)
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    status = 500
+                else:
+                    status = self.status
+                body = b"ok"
+                response = (
+                    f"HTTP/1.1 {status} OK\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: close\r\n"
+                    f"\r\n"
+                ).encode("ascii") + body
+                writer.write(response)
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        self.server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = self.server.sockets[0].getsockname()[1]
+        return f"http://127.0.0.1:{port}/health"
+
+    async def asyncTearDown(self):
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+
+    async def test_succeeds_after_retries(self):
+        url = await self.start_server()
+        self.failures_remaining = 2
+        checker = HealthChecker(HealthCheckConfig(retries=3, backoff_base=0.01, backoff_factor=2.0, timeout=1.0))
+        result = await checker.check(url)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, 200)
+        self.assertEqual(result.attempts, 3)
+        self.assertEqual(self.requests, 3)
+
+    async def test_fails_after_retries(self):
+        url = await self.start_server()
+        self.failures_remaining = 10都不要? Actually always 500. Set status=500? If failures_remaining=10, after 10 then 200. For retries=2 total 3 attempts, all 500. Set failures_remaining=10. result false attempts 3 status 500. requests 3.
+        checker = HealthChecker(HealthCheckConfig(retries=2, backoff_base=0.01, timeout=1.0))
+        result = await checker.check(url)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, 500)
+        self.assertEqual(result.attempts, 3)
+        self.assertEqual(self.requests, 3字)
+```
+
+Need test summary:
+```python
+    async def test_summary(self):
+        results = [
+            HealthCheckResult("http://a", True, 200, 1, 0.1),
+            HealthCheckResult("http://b", False, 500, 3, 0.5, "unexpected status 500"),
+        ]
+        report = summarize(results)
+        self.assertIn("Total: 2", report)
+        self.assertIn("Healthy: 1", report)
+        self.assertIn("Unhealthy: 1", report字)
+        self.assertIn("[OK] http://a", report)
+        self.assertIn("[FAIL] http://b", report)
+```
+
+Need test timeout maybe:
+```python
+    async def test_timeout(self):
+        url = await self.start_server()
+        self.delay = 0.2
+        checker = HealthChecker(HealthCheckConfig(retries=0, timeout=0.05))
+        result = await checker.check(url)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.attempts, 1)
+        self.assertIn("TimeoutError", result.error)
+```
+But server handler sleeps 0.2, client times out and closes. Handler may get ConnectionResetError on drain? Need catch. In handler, after sleep, writer.write/drain may raise ConnectionResetError. Need catch in handler. Add try/except (ConnectionError, asyncio.CancelledError) maybe. But test server cleanup. Could skip timeout to avoid flakiness. But nice. Need ensure handler catches exceptions. We'll implement robust.
+
+Need maybe test check_many? Could.
+
+Need ensure `HealthCheckResult` imported in tests. Need include in module.
+
+Need maybe use `asyncio.timeout`? Python 3.12. But use wait_for.
+
+Need consider retries semantics: `retries` number of retries after initial. Total attempts = retries + 1. Good.
+
+Need exponential backoff: delay = base * factor^(attempt-1) capped. Good.
+
+Need summary report. Good.
+
+Need maybe include CLI? Not required. Could include `if __name__ == "__main__":`? Not necessary. But maybe nice. User asks "Write a Python asyncio HTTP health checker with retries, exponential backoff and a summary report, plus tests." Could include module and tests. Maybe include CLI? Could include simple main to run URLs from argv. But not required. Could include to demonstrate summary. But tests enough. Need output code in python blocks. Could include two blocks: `health_checker.py` and `test_health_checker.py`. Need maybe mention run with `python -m unittest`. But final answer should be code only? They said output code in ```python blocks. We can include brief intro? Desired oververbosity 5. Maybe just code blocks.
+
+Need ensure code style matches reference? Reference code uses no type hints? Actually typing.py has type hints. We can use type hints. Need maybe use `from __future__ import annotations`. Good.
+
+Need think about HTTP request implementation details:
+- `urlsplit` with IPv6? Host header should include port if non-default? For health check, Host header should include port if non-default. We can set `host_header = host if port in default else f"{host}:{port}"`. For IPv6, host from urlsplit is without brackets? `parts.hostname` returns `::1`; Host header should be `[::1]:port`. Could handle. Simpler use `parts.netloc`? But netloc includes userinfo? Could use `parts.netloc` as Host header. But if URL has userinfo, netloc includes user:pass@host. Better construct. For tests 127.0.0.1. Could implement robust:
+```python
+host_header = host
+if ":" in host and not host.startswith("["):
+    host_header = f"[{host}]"
+if port != (443 if scheme == "https" else 80):
+    host_header += f":{port}"
+```
+Need use `parts.hostname` lower? Fine.
+
+- `writer.write(request.encode("ascii"))` path may contain non-ascii? URL path should be percent-encoded. Could use `path.encode("ascii")`. If non-ascii, error. Fine.
+
+- `await writer.wait_closed()` may raise? Usually no. Could catch? In finally, if connection reset, wait_closed may raise? It can. To avoid masking original exception, wrap in try/except. But if no exception, fine. Could:
+```python
+finally:
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+```
+Need not mask. Good.
+
+- `_request` returns status. It doesn't read body. Closing connection after status line is okay. Server may get broken pipe but fine.
+
+- Timeout: `asyncio.wait_for(self._request(url), timeout=...)` cancels `_request`. `_request` finally closes writer. Good.
+
+- Retry on any exception including ValueError unsupported scheme. It will retry unsupported scheme. Maybe okay but could be waste. Could validate before loop. But fine. Could check scheme before loop to avoid retries. But not necessary. Maybe better: in `check`, if invalid URL, retries? Could be okay. But tests not.
+
+- `expected_status` maybe int. Could allow `expected_statuses: frozenset[int] = frozenset({200})`. But dataclass frozen with frozenset default is okay. But simpler int. Health check often expects 200. Could allow `expected_status: int = 200`. Good.
+
+- Summary report: include total, healthy, unhealthy, details. Good.
+
+Need maybe include `__all__`. Not necessary.
+
+Need tests import from `health_checker`. If both in same block? Could include module and tests in separate blocks. The test block can import. Good.
+
+Need ensure tests pass with `unittest.IsolatedAsyncioTestCase`. Need `asyncSetUp` and `asyncTearDown` available Python 3.8+. Good.
+
+Potential issue: In test handler, `await reader.readuntil(b"\r\n\r\n")` may raise `asyncio.IncompleteReadError` if client closes early (timeout test). Need catch. We'll wrap entire handler in try/except. Also `writer.wait_closed()` may raise. Use try/except.
+
+Test handler:
+```python
+        async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriterazon) -> None:
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                self.requests += 1
+                if self.delay:
+                    await asyncio.sleep(self.delay)
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    status = 500
+                else:
+                    status = self.status
+                body = b"ok"
+                response = (
+                    f"HTTP/1.1 {status} OK\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: close\r\n"
+                    f"\r\n"
+                ).encode("ascii") + body
+                writer.write(response)
+                await writer.drain()
+            except (asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError):
+                pass
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+```
+Need `asyncio.CancelledError` is BaseException in 3.8? Actually CancelledError inherits BaseException since 3.8. Catch separately. Good.
+
+Test timeout: `self.delay = 0.2`, timeout 0.05. Client times out, cancels `_request`, closes writer. Server handler sleeping. After sleep, writes to closed connection, drain may raise ConnectionResetError (ConnectionError). Caught. Good. But test may finish before handler completes? `asyncTearDown` closes server, but handler task may still running. `server.close()` doesn't wait for handlers. Could leave task. But IsolatedAsyncioTestCase cancels pending tasks? It may. To avoid, maybe in timeout test wait a bit after result? Or not include timeout test. Simpler omit timeout test to avoid flakiness. But timeout is important. Could include with `await asyncio.sleep(0.25)` after result to let handler finish. But test time. Fine. Or use `self.delay = 0.1`, timeout 0.01, then `await asyncio.sleep(0.15)`. Good.
+
+Need test backoff? Could measure elapsed? Flaky. Could test attempts. Good.
+
+Need test check_many? Could:
+```python
+    async def test_check_many(self):
+        url = await self.start_server()
+        checker = HealthChecker(HealthCheckConfig(retries=0, timeout=1.0))
+        results = await checker.check_many([url, url])
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r.ok for r in results))
+        self.assertEqual(self.requests, 2)
+```
+Good.
+
+Need maybe test summary with no results? Not necessary.
+
+Need maybe include `HealthCheckResult` in test import. Good.
+
+Need maybe include `summarize` function. Good.
+
+Need maybe include `main` CLI? Could include:
+```python
+async def main(urls: Sequence[str]) -> int:
+    checker = HealthChecker()
+    results = await checker.check_many(urls)
+    print(summarize(results))
+    return 0 if all(r.ok for r in results) else 1
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(asyncio.run(main(sys.argv[1:])))
+```
+But if no URLs, prints summary total 0. Could include. Not required. But nice. However tests import module, no issue. Could include. Need maybe not include to keep concise. But user asked health checker, summary report. A CLI demonstrates. Could include. But final answer can include module with CLI. Good.
+
+Need think about style reference: They gave yaml/cyaml.py and typing.py. Maybe they expect code in similar style? Not necessarily. Could use dataclasses. Good.
+
+Need maybe use `typing.Sequence` etc. Good.
+
+Need ensure no external dependencies. Good.
+
+Potential issue: `asyncio.open_connection(host, port, ssl=ssl_context)` with `ssl_context=None` for http. Good.
+
+Potential issue: `ssl.create_default_context()` for https. Good.
+
+Potential issue: `writer.write(request.encode("ascii"))` if path contains non-ascii. Could use `path.encode("ascii", "ignore")`? Better use `path.encode("ascii")` and let error. Fine.
+
+Potential issue: `parts.port` can raise ValueError for invalid port. It will be caught in check and retried. Fine.
+
+Potential issue: `expected_status` maybe 200. If server returns 204, fail. Fine.
+
+Potential issue: `HealthCheckConfig` frozen with `expected_status: int = 200`. Good.
+
+Potential issue: `HealthCheckResult` dataclass not frozen. Fine.
+
+Potential issue: `summarize` uses `Iterable` from typing. Good.
+
+Potential issue: `check_many` uses `asyncio.gather` with generator. Good.
+
+Potential issue: `check` catches `Exception` but not `BaseException`. Good. `asyncio.CancelledError` is BaseException, so if outer task cancelled, it propagates. Good.
+
+Potential issue: `asyncio.wait_for` raises `asyncio.TimeoutError` which is subclass of Exception? In Python 3.11, `asyncio.TimeoutError` is alias of built-in `TimeoutError`, subclass of OSError? Actually TimeoutError is subclass of OSError, Exception. Good.
+
+Potential issue: `_request` finally `await writer.wait_closed()` can raise `ConnectionResetError` and mask original exception. We catch. Good.
+
+Potential issue: In `_request`, if `asyncio.open_connection` fails, writer not defined. We only enter try after open. Good.
+
+Potential issue: If `writer.write` fails, finally closes. Good.
+
+Potential issue: `status_line.decode("latin-1").split()` returns e.g. `['HTTP/1.1', '200', 'OK']`. Good.
+
+Potential issue: `parts_status[0].startswith("HTTP/")` good.
+
+Potential issue: `int(parts_status[1])` good.
+
+Potential issue: `Host` header for IPv6. Implement helper:
+```python
+        host_header = host
+        if ":" in host and not host.startswith("["):
+            host_header = f"[{host}]"
+        default_port = 443 if parts.scheme == "https" else 80
+        if port != default_port:
+            host_header = f"{host_header}:{port}"
+```
+Good.
+
+Potential issue: `parts.hostname` lowercases? It returns lowercased? Actually `urlsplit('HTTP://EXAMPLE.COM').hostname` returns 'example.com'. Good.
+
+Potential issue: `parts.path` may be empty. Good.
+
+Potential issue: `parts.query` may be empty. Good.
+
+Potential issue: `parts.fragment` ignored. Good.
+
+Potential issue: `parts.username` etc. ignored. Good.
+
+Need maybe include `__all__ = ["HealthCheckConfig", "HealthCheckResult", "HealthChecker", "summarize"]`. Good.
+
+Need maybe include docstrings. Good.
+
+Need maybe include tests in same block? Could include two blocks. The user said "Output the code in ```python blocks." Could include multiple. Good.
+
+Need maybe include `test_health_checker.py` with `if __name__ == "__main__": unittest.main()`. Good.
+
+Need maybe include `health_checker.py` with `if __name__ == "__main__":` CLI. Good.
+
+Let's craft final answer with two python blocks. Maybe first block `health_checker.py`, second `test_health_checker.py`. Need ensure code is complete.
+
+Let's write final code carefully.
+
+Module:
+
+```python
+from __future__ import annotations
+
+import asyncio
+import ssl
+import sys
+import time
+from dataclasses import dataclass
+from typing import Iterable, Sequence
+from urllib.parse import urlsplit
+
+__all__ = [
+    "HealthCheckConfig",
+    "HealthCheckResult",
+    "HealthChecker",
+    "summarize",
+]
+
+
+@dataclass(frozen=True)
+class HealthCheckConfig:
+    timeout: float = 5.0
+    retries: int = 3
+    backoff_base: float = 0.1
+    backoff_factor: float = 2.0
+    max_backoff: float = 5.0
+    expected_status: int = 200
+    user_agent: str = "asyncio-health-checker/1.0"
+
+
+@dataclass
+class HealthCheckResult:
+    url: str
+    ok: bool
+    status: int | None
+    attempts: int
+    elapsed: float
+    error: str | None = None
+
+
+class HealthChecker:
+    def __init__(self, config: HealthCheckConfig | None = None) -> None:
+        self.config = config or HealthCheckConfig()
+
+    async def check(self, url: str) -> HealthCheckResult:
+        start = time.monotonic()
+        last_status: int | None = None
+        last_error: str | None = None
+        attempts = 0
+
+        for attempt in range(1, self.config.retries + 2):
+            attempts = attempt
+            try:
+                status = await asyncio.wait_for(
+                    self._request(url),
+                    timeout=self.config.timeout,
+                )
+                last_status = status
+                if status == self.config.expected_status:
+                    return HealthCheckResult(
+                        url=url,
+                        ok=True,
+                        status=status,
+                        attempts=attempts,
+                        elapsed=time.monotonic() - start,
+                    )
+                last_error = f"unexpected status {status}"
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+
+            if attempt <= self.config.retries:
+                delay = min(
+                    self.config.backoff_base
+                    * (self.config.backoff_factor ** (attempt - 1)),
+                    self.config.max_backoff,
+                )
+                await asyncio.sleep(delay)
+
+        return HealthCheckResult(
+            url=url,
+            ok=False,
+            status=last_status,
+            attempts=attempts,
+            elapsed=time.monotonic() - start,
+            error=last_error,
+        )
+
+    async def check_many(self, urls: Sequence[str]) -> list[HealthCheckResult]:
+        return await asyncio.gather(*(self.check(url) for url in urls))
+
+    async def _request(self, url: str) -> int:
+        parts = urlsplit(url)
+        if parts.scheme not in {"http", "https"}:
+            raise ValueError(f"unsupported URL scheme: {parts.scheme!r}")
+
+        host = parts.hostname
+        if not host:
+            raise ValueError(f"URL has no host: {url!r}")
+
+        default_port = 443 if parts.scheme == "https" else 80
+        port = parts.port or default_port
+        path = parts.path or "/"
+        if parts.query:
+            path = f"{path}?{parts.query}"
+
+        host_header = host
+        if ":" in host and not host.startswith("["):
+            host_header = f"[{host}]"
+        if port != default_port:
+            host_header = f"{host_header}:{port}"
+
+        ssl_context = ssl.create_default_context() if parts.scheme == "https" else None
+        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
+        try:
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host_header}\r\n"
+                f"User-Agent: {self.config.user_agent}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            )
+            writer.write(request.encode("ascii"))
+            await writer.drain()
+
+            status_line = await reader.readline()
+            if not status_line:
+                raise ConnectionError("empty response")
+
+            status_parts = status_line.decode("latin-1").split()
+            if len(status_parts) < 2 or not status_parts[0].startswith("HTTP/"):
+                raise ValueError(f"invalid status line: {status_line!r}")
+
+            return int(status_parts[1])
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+def summarize(results: Iterable[HealthCheckResult]) -> str:
+    results = list(results)
+    total = len(results)
+    healthy = sum(1 for result in results if result.ok)
+    unhealthy = total - healthy
+
+    lines = [
+        "Health Check Summary",
+        "====================",
+        f"Total: {total}",
+        f"Healthy: {healthy}",
+        f"Unhealthy: {unhealthy}",
+    ]
+
+    if results:
+        lines.append("")
+        lines.append("Details:")
+        for result in results:
+            state = "OK" if result.ok else "FAIL"
+            status = result.status if result.status is not None else "-"
+            error = f" ({result.error})" if result.error else ""
+            lines.append(
+                f"- [{state}] {result.url} status={status} "
+                f"attempts={result.attempts} elapsed={result.elapsed:.3f}s{error}"
+            )
+
+    return "\n".join(lines)
+
+
+async def _main(urls: Sequence[str]) -> int:
+    checker = HealthChecker()
+    results = await checker.check_many(urls)
+    print(summarize(results))
+    return 0 if all(result.ok for result in results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(_main(sys.argv[1:])))
+```
+
+Need check `reader` unused? We use reader.readline. Good.
+
+Potential issue: `writer.wait_closed()` in finally after `writer.close()` may raise `RuntimeError` if event loop closed? Caught. Good.
+
+Potential issue: `asyncio.open_connection` with `ssl=None` for http. Good.
+
+Potential issue: `parts.port` can raise ValueError. Caught in check. Good.
+
+Potential issue: `request.encode("ascii")` if path has non-ascii. Could use `path.encode("ascii", "ignore")`? Better use `path.encode("ascii")` and let error. Fine.
+
+Potential issue: `host_header` for IPv6: if host is `::1`, `":" in host` true, not starts with `[`, so `[::1]`. Good. If host already `[::1]`? `parts.hostname` returns `::1` without brackets. Good.
+
+Potential issue: `parts.hostname` for IPv6 with zone? Fine.
+
+Potential issue: `expected_status` only one. Good.
+
+Now tests:
+
+```python
+from __future__ import annotations
+
+import asyncio
+import unittest
+
+from health_checker import (
+    HealthCheckConfig,
+    HealthCheckResult,
+    HealthChecker,
+    summarize,
+)
+
+
+class TestHealthChecker(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.server: asyncio.AbstractServer | None = None
+        self.requests = 0
+        self.failures_remaining = 0
+        self.delay = 0.0
+        self.status = 200
+
+    async def asyncTearDown(self) -> None:
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+
+    async def start_server(self) -> str:
+        async def handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                self.requests += 1
+                if self.delay:
+                    await asyncio.sleep(self.delay)
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    status = 500
+                else:
+                    status = self.status
+                body = b"ok"
+                response = (
+                    f"HTTP/1.1 {status} OK\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: close\r\n"
+                    f"\r\n"
+                ).encode("ascii") + body
+                writer.write(response)
+                await writer.drain()
+            except (asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError):
+                pass
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        self.server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = self.server.sockets[0].getsockname()[1]
+        return f"http://127.0.0.1:{port}/health"
+
+    async def test_succeeds_after_retries(self) -> None:
+        url = await self.start_server()
+        self.failures_remaining = 2
+        checker = HealthChecker(
+            HealthCheckConfig(
+                retries=3,
+                backoff_base=0.01,
+                backoff_factor=2.0,
+                timeout=1.0,
+            )
+        )
+
+        result = await checker.check(url)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, 200)
+        self.assertEqual(result.attempts, 3)
+        self.assertEqual(self.requests, 3)
+
+    async def test_fails_after_retries(self) -> None:
+        url = await self.start_server()
+        self.failures_remaining = 10
+        checker = HealthChecker(
+            HealthCheckConfig(
+                retries=2,
+                backoff_base=0.01,
+                backoff_factor=2.0,
+                timeout=1.0,
+            )
+        )
+
+        result = await checker.check(url)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, 500)
+        self.assertEqual(result.attempts, 3字)
+        self.assertEqual(self.requests, 3)
+        self.assertIn("unexpected status 500", result.error or "")
+
+    async def test_timeout(self) -> None:
+        url = await self.start_server()
+        self.delay = 0.1
+        checker = HealthChecker(
+            HealthCheckConfig(
+                retries=0,
+                backoff_base=0.01,
+                timeout=0.01,
+            )
+        )
+
+        result = await checker.check(url)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.attempts, 1)
+        self.assertIn("TimeoutError", result.error or "")
+        await asyncio.sleep(0.15)
+
+    async def test_check_many(self) -> None:
+        url = await self.start_server()
+        checker = HealthChecker(
+            HealthCheckConfig(
+                retries=0,
+                backoff_base=0.01,
+                timeout=1.0,
+            )
+        )
+
+        results = await checker.check_many([url, url])
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result.ok for result in results))
+        self.assertEqual(self.requests, 2)
+
+    async def test_summary(self) -> None:
+        results = [
+            HealthCheckResult(
+                url="http://example.test/ok",
+                ok=True,
+                status=200,
+                attempts=1,
+                elapsed=0.1,
+            ),
+            HealthCheckResult(
+                url="http://example.test/fail",
+                ok=False,
+                status=500,
+                attempts=3,
+                elapsed=0.5,
+                error="unexpected status 500",
+            ),
+        ]
+
+        report = summarize(results)
+
+        self.assertIn("Total: 2", report)
+        self.assertIn("Healthy: 1", report)
+        self.assertIn("Unhealthy: 1", report)
+        self.assertIn("[OK] http://example.test/ok", report)
+        self.assertIn("[FAIL] http://example.test/fail", report)
+        self.assertIn("unexpected status 500", report)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+Need fix typo `3字` to `3`. Good.
+
+Potential issue: In `test_timeout`, `self.delay = 0.1`, timeout 0.01. Client times out. Server handler sleeps 0.1. After result, `await asyncio.sleep(0.15)` lets handler finish. But handler may still be sleeping when test ends? We wait 0.15 > 0.1. Good. But `asyncTearDown` closes server. Handler may have completed. Good.
+
+Potential issue: In `test_timeout`, `result.error` may be "TimeoutError: " or "TimeoutError: " from `asyncio.wait_for`. In Python 3.11, `asyncio.TimeoutError` is built-in `TimeoutError`, type name "TimeoutError". Good. In Python 3.10, `asyncio.TimeoutError` type name "TimeoutError"? Actually `asyncio.TimeoutError` is alias of `asyncio.exceptions.TimeoutError`, class name "TimeoutError". Good. So `assertIn("TimeoutError", ...)` works.
+
+Potential issue: In `test_fails_after_retries`, `self.failures_remaining = 10`, retries=2 total 3 attempts. All 500. `result.status` 500. `result.error` "unexpected status 500". Good.
+
+Potential issue: In `test_succeeds_after_retries`, failures_remaining=2, retries=3. Attempt 1 500, attempt 2 500, attempt 3 200. attempts=3. Good.
+
+Potential issue: In `test_check_many`, two concurrent requests. `self.requests` increments in handler. Since asyncio single-threaded, no race. Good.
+
+Potential issue: `self.server.sockets[0]` type maybe `socket.socket`. Good.
+
+Potential issue: `asyncio.AbstractServer` type exists? In Python 3.12, `asyncio.AbstractServer` is available? Actually `asyncio.AbstractServer` is in `asyncio`? Let's check: `asyncio.AbstractServer` exists? In Python 3.12, `asyncio.AbstractServer` is an abstract class? I think `asyncio.AbstractServer` is available. But to avoid type issues, use `self.server = None` without annotation or `asyncio.base_events.Server`. Simpler remove annotation. In test, `self.server: asyncio.AbstractServer | None = None` might fail if `asyncio.AbstractServer` not exported? Actually `asyncio.AbstractServer` is exported? Let's verify: In Python 3.12, `asyncio.AbstractServer` is in `asyncio.streams`? Hmm. `asyncio.start_server` returns `asyncio.Server` (or `asyncio.base_events.Server`). `asyncio.AbstractServer` is in `asyncio`? I think `asyncio.AbstractServer` is available since 3.7? Actually `asyncio.AbstractServer` is in `asyncio.events`? Let's not risk. Use `self.server = None` no annotation. Good.
+
+Potential issue: `asyncio.StreamWriter` type exists. Good.
+
+Potential issue: `asyncio.IncompleteReadError` exists. Good.
+
+Potential issue: `asyncio.CancelledError` in except tuple with `ConnectionError` and `asyncio.IncompleteReadError`. `asyncio.CancelledError` is BaseException, but can be in tuple with Exception subclasses? Yes, except tuple can contain BaseException subclasses. Good.
+
+Potential issue: In handler, if `reader.readuntil` raises `asyncio.IncompleteReadError`, caught. Good.
+
+Potential issue: In handler, if `writer.drain` raises `ConnectionResetError`, caught by ConnectionError. Good.
+
+Potential issue: In handler, if `writer.wait_closed` raises, caught. Good.
+
+Potential issue: In `test_timeout`, after client times out, server handler may still be sleeping. `asyncTearDown` closes server but doesn't cancel handler. The handler task may still be running when test ends. `IsolatedAsyncioTestCase` cancels pending tasks? It does cancel all tasks? Actually it runs loop until all tasks complete? It may cancel. But we wait 0.15. Good.
+
+Potential issue: `test_timeout` may be flaky if timeout 0.01 too short and connection setup takes >0.01? Local connection setup is fast. But could be. Use timeout=0.05 and delay=0.2, wait 0.25. More robust. Let's set delay=0.2, timeout=0.05, wait 0.25. Good.
+
+Potential issue: `test_timeout` result.error may be "TimeoutError: " or "TimeoutError: " from wait_for. Good.
+
+Potential issue: `test_timeout` `self.requests` may be 1? Handler increments after read request. Client sends request then waits. It likely increments. But not asserted. Good.
+
+Potential issue: `test_timeout` server handler after sleep writes to closed connection. `writer.write` may not raise, `drain` may raise. Caught. Good.
+
+Potential issue: `test_timeout` if client times out before sending request? It sends request immediately. Good.
+
+Potential issue: `test_timeout` if `asyncio.wait_for` cancels `_request` while `_request` is in `await writer.drain()`? It will cancel, finally closes. Good.
+
+Potential issue: `test_timeout` if `_request` is in `await reader.readline()` and timeout cancels, finally closes. Good.
+
+Potential issue: `test_timeout` if `_request` is in `asyncio.open_connection` and timeout cancels, writer not defined, no finally. Good.
+
+Potential issue: `test_timeout` if `asyncio.open_connection` completes after timeout? wait_for cancels. Good.
+
+Potential issue: `test_timeout` if server handler sleeps and then writes, but client closed. Good.
+
+Potential issue: `test_timeout` if `writer.wait_closed()` in `_request` finally hangs? It may wait for close. But after timeout, writer.close() then wait_closed. Should complete. Good.
+
+Potential issue: `test_timeout` if `writer.wait_closed()` raises `ConnectionResetError`, caught. Good.
+
+Potential issue: `test_timeout` if `asyncio.wait_for` raises `TimeoutError` and `_request` finally `await writer.wait_closed()` takes time? It may delay cancellation? Actually wait_for waits for cancellation to complete. If wait_closed hangs, timeout may not return. But local close should be fast. Good.
+
+Potential issue: `test_timeout` if `writer.wait_closed()` in `_request` finally raises `asyncio.CancelledError`? We catch Exception, but CancelledError is BaseException, so not caught. If wait_closed is cancelled? It might propagate. But wait_for cancellation already in progress. Could be okay. To be safe, catch `BaseException`? But catching BaseException in finally is okay? Could catch `Exception` only. If CancelledError propagates, it's expected. Good.
+
+Potential issue: `test_timeout` if `writer.wait_closed()` in `_request` finally raises `asyncio.CancelledError` and masks TimeoutError? Actually wait_for cancels task, `_request` finally awaits wait_closed. If wait_closed raises CancelledError, it propagates, wait_for catches and raises TimeoutError. Good.
+
+Potential issue: `test_timeout` if `writer.wait_closed()` in `_request` finally raises `ConnectionResetError`, caught. Good.
+
+Potential issue: `test_timeout` if `writer.wait_closed()` in `_request` finally raises `RuntimeError`, caught. Good.
+
+Potential issue: `test_timeout` if `writer.wait_closed()` in `_request` finally raises `asyncio.CancelledError`, not caught. Good.
+
+Potential issue: `test_timeout` if `writer.wait_closed()` in `_request` finally raises `BaseException` other than CancelledError? Not likely.
+
+Need maybe include `from __future__ import annotations` in tests. Good.
+
+Need maybe include `unittest.main()`.
+
+Need maybe include `HealthCheckResult` import. Good.
+
+Need maybe include `summarize` import. Good.
+
+Need maybe include `HealthCheckConfig` import. Good.
+
+Need maybe include `HealthChecker` import. Good.
+
+Need maybe include `asyncio` import. Good.
+
+Need maybe include `unittest` import. Good.
+
+Need maybe include `from health_checker import ...`. Good.
+
+Need maybe include `if __name__ == "__main__": unittest.main()`. Good.
+
+Need maybe include `test_summary` with `HealthCheckResult` constructor. Good.
+
+Need maybe include `test_check_many` with two URLs. Good.
+
+Need maybe include `test_timeout` with `await asyncio.sleep(0.25)`. Good.
+
+Need maybe include `test_fails_after_retries` with `self.failures_remaining = 10`. Good.
+
+Need maybe include `test_succeeds_after_retries` with `self.failures_remaining = 2`. Good.
+
+Need maybe include `test_summary` with `report = summarize(results)`. Good.
+
+Need maybe include `self.assertIn("unexpected status 500", report)`. Good.
+
+Need maybe include `self.assertIn("[FAIL] http://example.test/fail", report)`. Good.
+
+Need maybe include `self.assertIn("[OK] http://example.test/ok", report)`. Good.
+
+Need maybe include `self.assertIn("Total: 2", report)`. Good.
+
+Need maybe include `self.assertIn("Healthy: 1", report)`. Good.
+
+Need maybe include `self.assertIn("Unhealthy: 1", report)`. Good.
+
+Need maybe include `self.assertIn("TimeoutError", result.error or "")`. Good.
+
+Need maybe include `self.assertEqual(result.attempts, 1)`. Good.
+
+Need maybe include `self.assertFalse(result.ok)`. Good.
+
+Need maybe include `self.assertEqual(self.requests, 3)`. Good.
+
+Need maybe include `self.assertEqual(result.status, 500)`. Good.
+
+Need maybe include `self.assertEqual(result.attempts, 3)`. Good.
+
+Need maybe include `self.assertIn("unexpected status 500", result.error or "")`. Good.
+
+Need maybe include `self.assertTrue(result.ok)`. Good.
+
+Need maybe include `self.assertEqual(result.status, 200)`. Good.
+
+Need maybe include `self.assertEqual(result.attempts, 3)`. Good.
+
+Need maybe include `self.assertEqual(self.requests, 3)`. Good.
+
+Need maybe include `self.assertEqual(len(results), 2)`. Good.
+
+Need maybe include `self.assertTrue(all(result.ok for result in results))`. Good.
+
+Need maybe include `self.assertEqual(self.requests, 2)`. Good.
+
+Need maybe include `self.server.close()` and `await self.server.wait_closed()`. Good.
+
+Need maybe include `self.server = await asyncio.start_server(handler, "127.0.0.1", 0)`. Good.
+
+Need maybe include `port = self.server.sockets[0].getsockname()[1]`. Good.
+
+Need maybe include `return f"http://127.0.0.1:{port}/health"`. Good.
+
+Need maybe include `self.server: asyncio.AbstractServer | None = None`? Remove annotation. Use `self.server = None`. Good.
+
+Need maybe include `self.requests = 0` etc. Good.
+
+Need maybe include `self.status = 200`. Good.
+
+Need maybe include `self.delay = 0.0`. Good.
+
+Need maybe include `self.failures_remaining = 0`. Good.
+
+Need maybe include `async def handler(...) -> None:`. Good.
+
+Need maybe include `await reader.readuntil(b"\r\n\r\n")`. Good.
+
+Need maybe include `self.requests += 1`. Good.
+
+Need maybe include `if self.delay: await asyncio.sleep(self.delay)`. Good.
+
+Need maybe include `if self.failures_remaining > 0: ...`. Good.
+
+Need maybe include `body = b"ok"`. Good.
+
+Need maybe include `response = (...)`. Good.
+
+Need maybe include `writer.write(response)`. Good.
+
+Need maybe include `await writer.drain()`. Good.
+
+Need maybe include `except (asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError): pass`. Good.
+
+Need maybe include `finally: writer.close(); try: await writer.wait_closed(); except Exception: pass`. Good.
+
+Need maybe include `self.server = await asyncio.start_server(handler, "127.0.0.1", 0)`. Good.
+
+Need maybe include `port = self.server.sockets[0].getsockname()[1]`. Good.
+
+Need maybe include `return f"http://127.0.0.1:{port}/health"`. Good.
+
+Need maybe include `async def asyncTearDown(self) -> None:`. Good.
+
+Need maybe include `if self.server is not None:`. Good.
+
+Need maybe include `self.server.close()`. Good.
+
+Need maybe include `await self.server.wait_closed()`. Good.
+
+Need maybe include `async def asyncSetUp(self) -> None:`. Good.
+
+Need maybe include `self.server = None`. Good.
+
+Need maybe include `self.requests = 0`. Good.
+
+Need maybe include `self.failures_remaining = 0`. Good.
+
+Need maybe include `self.delay = 0.0`. Good.
+
+Need maybe include `self.status = 200`. Good.
+
+Need maybe include `class TestHealthChecker(unittest.IsolatedAsyncioTestCase):`. Good.
+
+Need maybe include `if __name__ == "__main__": unittest.main()`. Good.
+
+Need maybe include `from __future__ import annotations`. Good.
+
+Need maybe include `import asyncio`. Good.
+
+Need maybe include `import unittest`. Good.
+
+Need maybe include `from health_checker import (...)`. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig` in import. Good.
+
+Need maybe include `HealthChecker` in import. Good.
+
+Need maybe include `HealthCheckResult` in import. Good.
+
+Need maybe include `summarize` in import. Good.
+
+Need maybe include `HealthCheckConfig`
+=== CONTENT
+

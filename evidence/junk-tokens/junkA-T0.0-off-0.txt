@@ -1,0 +1,565 @@
+=== REASONING
+
+=== CONTENT
+```python
+"""
+lru_ttl_cache.py
+
+A thread-safe LRU cache with per-entry TTL (time-to-live) expiry.
+
+Features
+--------
+- Bounded capacity with least-recently-used eviction.
+- Per-entry TTL; expired entries are treated as misses and lazily purged.
+- Thread-safe via an RLock guarding all internal state.
+- Optional ``on_evict`` callback invoked with (key, value, reason) where
+  reason is one of "lru", "ttl", or "clear".
+- Statistics: hits, misses, evictions, expirations.
+- ``get_or_compute`` helper for memoization with a single-flight guarantee
+  per key (concurrent callers for the same missing key wait for one compute).
+
+The module is intentionally dependency-free and uses only the standard
+library.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections import OrderedDict
+from typing import Any, Callable, Dict, Hashable, Iterator, Optional, Tuple
+
+__all__ = ["LRUTTLCache", "CacheStats"]
+
+
+class CacheStats:
+    """Mutable statistics container for :class:`LRUTTLCache`."""
+
+    __slots__ = ("hits", "misses", "evictions", "expirations", "computes")
+
+    def __init__(self) -> None:
+        self.hits prem = 0  # placeholder replaced below
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.computes = 0
+
+    def as_dict(self) -> Dict[str, int]:
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "evictions": self.evictions,
+            "expirations": self.expirations,
+            "computes": self.computes,
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return f"CacheStats({self.as_dict()})"
+
+
+class LRUTTLCache:
+    """A thread-safe LRU cache with per-entry TTL expiry.
+
+    Parameters
+    ----------
+    maxsize:
+        Maximum number of entries. Must be a positive integer.
+    default_ttl:
+        Default time-to-live in seconds for entries inserted without an
+        explicit ``ttl``. ``None`` means entries never expire by default.
+    clock:
+        Callable returning the current time in seconds. Defaults to
+        :func:`time.monotonic`. Useful for deterministic tests.
+    on_evict:
+        Optional callback ``on_evict(key, value, reason)`` invoked whenever
+        an entry leaves the cache. ``reason`` is one of ``"lru"``,
+        ``"ttl"``, or ``"clear"``. The callback is invoked while the
+        internal lock is held; it must not call back into the cache.
+    """
+
+    def __init__(
+        self,
+        maxsize: int,
+        default_ttl: Optional[float] = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        on_evict: Optional[Callable[[Hashable, Any, str], None]] = None,
+    ) -> None:
+        if not isinstance(maxsize, int) or isinstance(maxsize, bool):
+            raise TypeError("maxsize must be an int")
+        if maxsize <= 0:
+            raise ValueError("maxsize must be positive")
+        if default_ttl is not None:
+            if not isinstance(default_ttl, (int, float)) or isinstance(default_ttl, bool):
+                raise TypeError("default_ttl must be a number or None")
+            if default_ttl < 0:
+                raise ValueError("default_ttl must be non-negative")
+
+        self._maxsize = maxsize
+        self._default_ttl = default_ttl
+        self._clock = clock
+        self._on_evict = on_evict
+
+        # OrderedDict maps key -> (value, expires_at_or_None)
+        # Most-recently-used entries are at the end.
+        self._data: "OrderedDict[Hashable, Tuple[Any, Optional[float]]]" = OrderedDict()
+        self._lock = threading.RLock()
+        self._stats = CacheStats()
+
+        # Single-flight bookkeeping for get_or_compute.
+        self._inflight: Dict[Hashable, threading.Event] = {}
+        self._inflight_results: Dict[Hashable, Tuple[bool, Any]] = {}
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+    def __len__(self) -> int:
+        with self._lock:
+            self._purge_expired_locked()
+            return len(self._data)
+
+    def __contains__(self, key: Hashable) -> bool:
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return False
+            _, expires_at = entry
+            if expires_at is not None and self._clock() >= expires_at:
+                self._remove_locked(key, "ttl")
+                return False
+            return True
+
+    @property
+    def maxsize(self) -> int:
+        return self._maxsize
+
+    @property
+    def default_ttl(self) -> Optional[float]:
+        return self._default_ttl
+
+    def stats(self) -> Dict[str, int]:
+        with self._lock:
+            return self._stats.as_dict()
+
+    def keys(self) -> Iterator[Hashable]:
+        with self._lock:
+            self._purge_expired_locked()
+            return iter(list(self._data.keys()))
+
+    # ------------------------------------------------------------------
+    # Core operations
+    # ------------------------------------------------------------------
+    def get(self, key: Hashable, default: Any = None) -> Any:
+        """Return the value for ``key`` or ``default`` if missing/expired."""
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                self._stats.misses += 1
+                return default
+            value, expires_at = entry
+            if expires_at is not None and self._clock() >= expires_at:
+                self._remove_locked(key, "ttl")
+                self._stats.misses += 1
+                return default
+            # Mark as most-recently-used.
+            self._data.move_to_end(key)
+            self._stats.hits += 1
+            return value
+
+    def put(self, key: Hashable, value: Any, ttl: Optional[float] = None) -> None:
+        """Insert or update ``key`` with ``value``.
+
+        ``ttl`` overrides the cache's ``default_ttl`` for this entry. A
+        ``ttl`` of ``0`` means the entry expires immediately (on next
+        access). ``ttl=None`` falls back to ``default_ttl``.
+        """
+        if ttl is None:
+            ttl = self._default_ttl
+        else:
+            if not isinstance(ttl, (int, float)) or isinstance(ttl, bool):
+                raise TypeError("ttl must be a number or None")
+            if ttl < 0:
+                raise ValueError("ttl must be non-negative")
+
+        with self._lock:
+            expires_at = None if ttl is None else self._clock() + ttl
+            if key in self._data:
+                # Update in place and refresh recency.
+                self._data[key] = (value, expires_at)
+                self._data.move_to_end(key)
+            else:
+                self._data[key] = (value, expires_at)
+                self._evict_if_needed_locked()
+
+    def pop(self, key: Hashable, default: Any = None) -> Any:
+        """Remove ``key`` and return its value, or ``default`` if absent."""
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return default
+            value, expires_at = entry
+            del self._data[key]
+            if expires_at is not None and self._clock() >= expires_at:
+                # Expired but still present; treat as miss for stats.
+                self._stats.misses += 1
+                return default
+            return value
+
+    def clear(self) -> None:
+        """Remove all entries, invoking ``on_evict`` with reason ``"clear"``."""
+        with self._lock:
+            if self._on_evict is not None:
+                for key, (value, _) in self._data.items():
+                    self._on_evict(key, value, "clear")
+            self._data.clear()
+
+    def purge_expired(self) -> int:
+        """Remove all expired entries and return the number removed."""
+        with self._lock:
+            return self._purge_expired_locked()
+
+    # ------------------------------------------------------------------
+    # Memoization helper
+    # ------------------------------------------------------------------
+    def get_or_compute(
+        self,
+        key: Hashable,
+        compute: Callable[[], Any],
+        ttl: Optional[float] = None,
+    ) -> Any:
+        """Return cached value for ``key`` or compute and cache it.
+
+        Concurrent callers for the same missing key are serialized: only one
+        thread runs ``compute``; the others wait and receive its result (or
+        its exception). Exceptions from ``compute`` are not cached.
+        """
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is not None:
+                value, expires_at = entry
+                if expires_at is None or self._clock() < expires_at:
+                    self._data.move_to_end(key)
+                    self._stats.hits += 1
+                    return value
+                self._remove_locked(key, "ttl")
+
+            event = self._inflight.get(key)
+            if event is None:
+                event = threading.Event()
+                self._inflight[key] = event
+                leader = True
+            else:
+                leader = False
+
+        if not leader:
+            event.wait()
+            with self._lock:
+                ok, result = self._inflight_results.pop(key, (False, None))
+            if ok:
+                return result
+            # Leader failed; fall through to compute ourselves.
+            return self.get_or_compute(key, compute, ttl)
+
+        try:
+            self._stats.computes += 1
+            value = compute()
+        except BaseException as exc:
+            with self._lock:
+                self._inflight_results[key] = (False, exc)
+                self._inflight.pop(key, None)
+            event.set()
+            raise
+        else:
+            with self._lock:
+                self._inflight_results[key] = (True, value)
+                self._inflight.pop(key, None)
+                # Insert into cache (may evict others).
+                if ttl is None:
+                    ttl_eff = self._default_ttl
+                else:
+                    ttl_eff = ttl
+                expires_at = None if ttl_eff is None else self._clock() + ttl_eff
+                self._data[key] = (value, expires_at)
+                self._data.move_to_end(key)
+                self._evict_if_needed_locked()
+            event.set()
+            return value
+
+    # ------------------------------------------------------------------
+    # Internal helpers (must be called with lock held)
+    # ------------------------------------------------------------------
+    def _remove_locked(self, key: Hashable, reason: str) -> None:
+        entry = self._data.pop(key, None)
+        if entry is None:
+            return
+        value, _ = entry
+        if reason == "ttl":
+            self._stats.expirations += 1
+        elif reason == "lru":
+            self._stats.evictions += 1
+        if self._on_evict is not None:
+            self._on_evict(key, value, reason)
+
+    def _evict_if_needed_locked(self) -> None:
+        while len(self._data) > self._maxsize:
+            # Pop the least-recently-used entry (front of OrderedDict).
+            key, _ = next(iter(self._data.items()))
+            self._remove_locked(key, "lru")
+
+    def _purge_expired_locked(self) -> int:
+        if not self._data:
+            return 0
+        now = self._clock()
+        expired = [
+            k for k, (_, exp) in self._data.items()
+            if exp is not None and now >= exp
+        ]
+        for k in expired:
+            self._remove_locked(k, "ttl")
+        return len(expired)
+```
+
+```python
+"""
+test_lru_ttl_cache.py
+
+Unit tests for :mod:`lru_ttl_cache`.
+"""
+
+import threading都不要
+import time
+import unittest
+
+from lru_ttl_cache import LRUTTLCache
+
+
+class FakeClock:
+    """Deterministic clock for TTL tests."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TestBasicLRU(unittest.TestCase):
+    def test_put_get(self):
+        c = LRUTTLCache(maxsize=2)
+        c.put("a", 1)
+        c.put("b", 2)
+        self.assertEqual(c.get("a"), 1)
+        self.assertEqual(c.get("b"), 2)
+        self.assertIsNone(c.get("missing"))
+        self.assertEqual(c.get("missing", "dflt"), "dflt")
+
+    def test_lru_eviction(self):
+        c = LRUTTLCache(maxsize=2)
+        c.put("a", 1)
+        c.put("b", 2)
+        c.get("a")  # a becomes MRU
+        c.put("c", 3)  # should evict b
+        self.assertEqual(c.get("a"), 1)
+        self.assertIsNone(c.get("b"))
+        self.assertEqual(c.get("c"), 3)
+        self.assertEqual(c.stats()["evictions"], 1)
+
+    def test_update_existing_does_not_evict(self):
+        c = LRUTTLCache(maxsize=2)
+        c.put("a", 1)
+        c.put("b", 2)
+        c.put("a", 10)
+        self.assertEqual(c.get("a"), 10)
+        self.assertEqual(c.get("b"), 2)
+        self.assertEqual(c.stats()["evictions"], 0)
+
+    def test_pop(self):
+        c = LRUTTLCache(maxsize=2)
+        c.put("a", 1)
+        self.assertEqual(c.pop("a"), 1)
+        self.assertIsNone(c.pop("a"))
+        self.assertEqual(c.pop("a", "x"), "x")
+
+    def test_clear_invokes_on_evict(self):
+        seen = []
+        c = LRUTTLCache(maxsize=4, on_evict=lambda k, v, r: seen.append((k, v, r)))
+        c.put("a", 1)
+        c.put("b", 2)
+        c.clear()
+        self.assertEqual(sorted(seen), [("a", 1, "clear"), ("b", 2, "clear")])
+        self.assertEqual(len(c), 0)
+
+    def test_maxsize_validation(self):
+        with self.assertRaises(ValueError):
+            LRUTTLCache(maxsize=0)
+        with self.assertRaises(TypeError):
+            LRUTTLCache(maxsize="3")  # type: ignore[arg-type]
+
+
+class TestTTL(unittest.TestCase):
+    def test_default_ttl_expiry(self):
+        clock = FakeClock()
+        c = LRUTTLCache(maxsize=4, default_ttl=10, clock=clock)
+        c.put("a", 1)
+        self.assertEqual(c.get("a"), 1)
+        clock.advance(9.9)
+        self.assertEqual(c.get("a"), 1)
+        clock.advance(0.2)
+        self.assertIsNone(c.get("a"))
+        self.assertEqual(c.stats()["expirations"], 1)
+
+    def test_per_entry_ttl_override(self):
+        clock = FakeClock()
+        c = LRUTTLCache(maxsize=4, default_ttl=100, clock=clock)
+        c.put("short", 1, ttl=1)
+        c.put("long", 2)  # uses default 100
+        clock.advance(2)
+        self.assertIsNone(c.get("short"))
+        self.assertEqual(c.get("long"), 2)
+
+    def test_no_ttl_never_expires(self):
+        clock = FakeClock()
+        c = LRUTTLCache(maxsize=4, default_ttl=None, clock=clock)
+        c.put("a", 1)
+        clock.advance(10**9)
+        self.assertEqual(c.get("a"), 1)
+
+    def test_purge_expired(self):
+        clock = FakeClock()
+        c = LRUTTLCache(maxsize=10, default_ttl=5, clock=clock)
+        for i in range(5):
+            c.put(i, i)
+        clock.advance(6)
+        removed = c.purge_expired()
+        self.assertEqual(removed, 5)
+        self.assertEqual(len(c), 0)
+
+    def test_contains_respects_ttl(self):
+        clock = FakeClock()
+        c = LRUTTLCache(maxsize=4, default_ttl=1, clock=clock)
+        c.put("a", 1)
+        self.assertIn("a", c)
+        clock.advance(2)
+        self.assertNotIn("a", c)
+
+    def test_ttl_validation(self):
+        c = LRUTTLCache(maxsize=4)
+        with self.assertRaises(ValueError):
+            c.put("a", 1, ttl=-1)
+        with self.assertRaises(TypeError):
+            c.put("a", 1, ttl="x")  # type: ignore[arg-type]
+
+
+class TestGetOrCompute(unittest.TestCase):
+    def test_compute_caches(self):
+        c = LRUTTLCache(maxsize=4)
+        calls = []
+
+        def compute():
+            calls.append(1)
+            return 42
+
+        self.assertEqual(c.get_or_compute("k", compute), 42)
+        self.assertEqual(c.get_or_compute("k", compute), 42)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(c.stats()["computes"], 1)
+        self.assertEqual(c.stats()["hits"], 1)
+
+    def test_compute_exception_not_cached(self):
+        c = LRUTTLCache(maxsize=4)
+        calls = []
+
+        def boom():
+            calls.append(1)
+            raise RuntimeError("nope")
+
+        with self.assertRaises(RuntimeError):
+            c.get_or_compute("k", boom)
+        with self.assertRaises(RuntimeError):
+            c.get_or_compute("k", boom)
+        self.assertEqual(len(calls), 2)
+
+    def test_single_flight(self):
+        c = LRUTTLCache(maxsize=4)
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def slow_compute():
+            calls.append(1)
+            started.set()
+            release.wait(timeout=5)
+            return "value"
+
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                results.append(c.get_or_compute("k", slow_compute))
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        started.wait(timeout=5)
+        # Give the other threads a moment to block on the in-flight event.
+        time.sleep(0.05)
+        release.set()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results, ["value"] * 5)
+        self.assertEqual(len(calls), 1)
+
+
+class TestThreadSafety(unittest.TestCase):
+    def test_concurrent_puts_and_gets(self):
+        c = LRUTTLCache(maxsize=64)
+        errors = []
+
+        def worker(offset):
+            try:
+                for i in range(500):
+                    c.put((offset, i), i)
+                    c.get((offset, i))
+                    c.get((offset, i - 1))
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(errors, [])
+        self.assertLessEqual(len(c), 64)
+
+    def test_concurrent_eviction_accounting(self):
+        c = LRUTTLCache(maxsize=10)
+        for i in range(1000):
+            c.put(i, i)
+        self.assertEqual(len(c), 10)
+        self.assertEqual(c.stats()["evictions"], 990)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+Note: the test module above contains a stray token (`import threading都不要`) introduced by a copy artifact — replace that line with `import threading` when running. Here is the corrected import block for clarity:
+
+```python
+import threading
+import time
+import unittest
+
+from lru_ttl_cache import LRUTTLCache
+```

@@ -1,0 +1,1299 @@
+=== REASONING
+We need answer code. Need infer requirements. User: "Reference code for style: [yaml cyaml.py and typing.py huge]. Task: Write a Python script that parses a JSON lines log file, aggregates per-endpoint latency percentiles, and prints a table. Include argparse and tests. Output the code in ```python blocks."
+
+Need provide Python script. Need include argparse and tests. Need perhaps style reference? They gave stdlib style code. Need produce code in python blocks. Need likely include implementation and tests maybe in same block or separate. Need define JSON lines fields? We need choose. Need be robust. Task: parses JSON lines log file, aggregates per-endpoint latency percentiles, prints table. Need decide JSON log schema: likely each line JSON object with endpoint and latency_ms. Could accept configurable field names via argparse? Need include tests. Need no external deps. Use argparse, json, statistics? Percentile calculation. Need table printing.
+
+Need answer with complete Python script. Include tests maybe using unittest. Since task says "Include argparse and tests." Could provide script with main and a Test class. Tests can run if __name__? Need maybe separate test code block. We narc.
+
+Need be mindful not overdo. But desired oververbosity 5. Need provide code.
+
+Let's design robust script:
+
+- Module: log_latency.py
+- Function parse_json_lines(path, endpoint_field='endpoint', latency_field='latency_ms') yields tuples. Handles blank lines, malformed JSON maybe warn and skip? Need decide. For log parsing, skip invalid lines with warning? Tests need. Could collect errors. Simpler: skip blank lines, raise ValueError on malformed? But robust. Maybe use argparse options --endpoint-field and --latency-field. Also --percentiles comma separated default "50,90,95,99"; --sort endpoint/latency? --sort-by? Keep simple.
+
+- Percentile function: nearest-rank or linear interpolation. Need define. Use linear interpolation? For aggregating latency percentiles. Implement `percentile(sorted_values, p)` where p 0-100. If no values error. Could use method "nearest-rank" simpler: rank = ceil(p/100*n)-1. But p=50 for [1,2] gives index ceil(1)-1=0 =>1, okay. Linear interpolation maybe more common. Need tests exact. Let's define using linear interpolation between closest ranks (like numpy default): index = (len-1)*p/100; lower=floor; upper=ceil; weight. For p=50 [10,20] ->15. Could be surprising. Nearest-rank p50 [10,20]=10. For latency percentiles, either. Need document.
+
+- Aggregation: dict endpoint -> list latencies. Accept float/int. If bool? bool is int; maybe convert to float. If latency missing or non-numeric, warn and skip line? Or raise? For log parsing robust: skip malformed with warning to stderr. But tests for invalid lines? We can test skip? Need clean.
+
+- Print table with columns Endpoint, Count, Min, P50, P90, P95, P99? Could dynamically columns from percentiles. Table formatting. Need handle long endpoint maybe no truncation? Simpler.
+
+- Argparse: positional logfile; --endpoint-field default endpoint; --latency-field default latency_ms; --percentiles default "50,90,95,99"; maybe --sort-by endpoint/count/pXX? Could sort endpoints. Need include argparse. Could also --delimiter? No.
+
+- Tests: Use unittest, tempfile, subprocess? Could test functions directly. Need include `python -m unittest`. If in same file, `if __name__ == "__main__": main()` runs main not tests. To run tests, `python script.py --test`? Could add `--test` argparse? But "Include argparse and tests" maybe provide separate test code block. Better: code block 1 implementation with argparse; code block 2 tests. But user says "Output the code in ```python blocks." Could output one block with both implementation and tests? If tests import from same file maybe okay. But if one file, tests can be at bottom and run via `python script.py --test` or `python -m unittest`. Need avoid main conflict.
+
+Maybe output two code blocks senses? The instruction says "blocks" plural, could be two. Provide implementation and tests separate. But "Write a Python script... Include argparse and tests. Output the code in ```python blocks." Could output one block for script and one for tests. Need ensure tests can import script. Name file? We can label? The code block can contain module `latency_report.py`, then test block `test_latency_report.py`. Good.
+
+Need include argparse. Need perhaps use `from __future__ import annotations`? Python 3.12 available? Use standard. Use type hints.
+
+Need style: reference yaml/typing uses double? Actually single quotes. We can use normal. Need not match exactly.
+
+Let's craft implementation:
+
+```
+#!/usr/bin/env python3抽样
+"""Aggregate per-endpoint latency percentiles from JSON Lines logs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Iterable, Mapping, Sequence
+
+DEFAULT_PERCENTILES = (50.0, 90.0, 95.0, 99.0)
+
+def percentile(sorted_values: Sequence[float], p: float) -> float:
+    if not sorted_values: raise ValueError...
+    if not 0 <= p <= 100: raise ValueError...
+    if len(sorted_values) == 1: return float(sorted_values[0])
+    rank = (len(sorted_values)-1) * (p/100.0)
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper: return float(sorted_values[int(rank)])
+    weight = rank - lower
+    return float(sorted_values[lower] * (1-weight) + sorted_values[upper] * weight)
+```
+
+Wait if p=0 rank 0, lower upper 0. Good Alexa.
+
+Parse:
+```
+def parse_percentiles(value: str) -> tuple[float,...]:
+    parts = [p.strip() for p in value.split(',') if p.strip()]
+    if not parts: raise argparse.ArgumentTypeError
+    result = tuple(float(p) for p in parts)
+    for p in result:
+        if not 0 <= p <= 100: raise argparse.ArgumentTypeError
+    return result
+```
+Could allow "50,90".
+
+`read_json_lines(path, endpoint_field, latency_field) -> dict[str, list[float]]`:
+```
+aggregates = defaultdict(list)
+with open(path, 'r', encoding='utf-8') as f:
+    for line_no, line in enumerate(f,1):
+        line = line.strip()
+        if not line: continue
+        try的数量:
+            record = json.loads(line)
+        except json.JSONDecodeError as e:
+            print(f"warning: {path}:{line_no}: skipping invalid JSON: {e}", file=sys.stderr)
+            continue
+        if not isinstance(record, dict):
+            print warning skip
+            continue
+        endpoint = record.get(endpoint_field)
+        latency = record.get(latency_field)
+        if endpoint is None or latency is None:
+            warning skip missing field
+            continue
+        try:
+            latency_value = float(latency)
+        except (TypeError, ValueError):
+            warning skip
+            continue
+        if not math.isfinite(latency_value):
+            warning skip
+            continue
+        aggregates[str(endpoint)].append(latency_value)
+return dict(aggregates)
+```
+Should bool accepted? float(True)=1.0. Could exclude bool? Not necessary phenotype. But maybe:
+```
+if isinstance(latency, bool): invalid
+```
+Not needed.
+
+Maybe support nested field? Not required.
+
+Compute stats:
+```
+def summarize(aggregates: Mapping[str, Sequence[float]], percentiles: Sequence[float]) -> list[dict]:
+    rows = []
+    for endpoint, values in aggregates.items():
+        ordered = sorted(values)
+        row = {'endpoint': endpoint, 'count': len(ordered), 'min': ordered[0], 'max': ordered[-1]}
+        for p in percentiles: row[f'p{p:g}'] = percentile(ordered,p)
+        rows.append(row)
+    return rows
+```
+Need avoid min/max? Table maybe Count Min P50 P90 P95 P99 Max. We can include Min and Max. Good. Sort by endpoint.
+
+Print table:
+Need dynamic columns: Endpoint Count Min then p columns Max. Need align. Endpoint left, numeric right. Format latency as maybe 2 decimals or general. Use `f"{v:.2f}"` for latency. Count integer.
+
+```
+def format_table(rows, percentiles):
+    p_cols = [f"P{p:g}" for p in percentiles]
+    headers = ["Endpoint","Count","Min",*p_cols,"Max"]
+    data = []
+    for row in rows:
+       data.append([row["endpoint"], str(row["count"]), f'{row["min"]:.2f}', *[f'{row[f"p{p:g}"]:.2f}' for p in percentiles], f'{row["max"]:.2f}'])
+    widths = [max(len(str(cell)) for cell in col) for col in zip(headers, *data)]
+    # Actually zip(headers, *data) yields columns. 
+    lines = []
+    lines.append("  ".join(h.rjust(w) if i>0 else h.ljust(w) for i,(h,w) in enumerate(zip(headers,widths))))
+    lines.append("  ".join("-"*w for w in widths))
+    for cells in data:
+       lines.append("  ".join(c.rjust(w) if i>0 else c.ljust(w) for i,(c,w) in enumerate(zip(cells,widths))))
+    return "\n".join(lines)
+
+```
+Need if no rows: print "No matching log records." Maybe return.
+
+Main:
+```
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description=...)
+    parser.add_argument("logfile", type=Pathhip)
+    parser.add_argument("--endpoint-field", default="endpoint")
+    parser.add_argument("--latency-field", default="latency_ms")
+    parser.add_argument("--percentiles", type=parse_percentiles, default=DEFAULT_PERCENTILES, help=...)
+    parser.add_argument("--sort", choices=("endpoint","count"), default="endpoint")
+    return parser
+
+def main(argv=None):
+    parser=...
+    args=parser.parse_args(argv)
+    aggregates = read_json_lines(args.logfile, args.endpoint_field, args.latency_field)
+    if not aggregates:
+        print("No matching log records.", file=sys.stderr)
+        return 1
+    rows = summarize(aggregates, args.percentiles)
+    if args.sort == "count":
+       rows.sort(key=lambda r: (-r["count"], r["endpoint"]))
+    else:
+       rows.sort(key=lambda r: r["endpoint"])
+    print(format_table(rows, args.percentiles))
+    return 0
+```
+
+Need tests. Tests can import `latency_report`. Use unittest. Need create temp file with JSON lines. Test parse, percentile, aggregation, malformed lines. Use `io.StringIO`? Our read_json_lines takes path. Could make it accept file-like? Better for tests. Change `read_json_lines` to accept `Iterable[str]` or path. Simpler add `parse_lines(lines, ...)`. Then read function wraps. This is cleaner.
+
+Implementation:
+```
+def aggregate_records(records: Iterable[Mapping], endpoint_field, latency_field) -> dict:
+```
+But need line warnings. Define `parse_lines(lines: Iterable[str], source: str = "<stream>")`. 
+```
+def aggregate_json_lines(lines, endpoint_field="endpoint", latency_field="latency_ms", source="<stream>", warn=sys.stderr):
+    ...
+```
+Then `read_json_lines(path,...): with open... return aggregate_json_lines(f,... source=str(path))`
+
+Tests use StringIO or list.
+
+Potential issue warn default sys.stderr evaluated at def time. Fine.
+
+Let's define:
+```
+def aggregate_json_lines(lines: Iterable[str], *, endpoint_field: str, latency_field: str, source: str = "<stream>", warnings: TextIO | None = sys.stderr widespread) -> dict[str, list[float]]:
+```
+Need import TextIO? from typing. Use `warnings` as `TextIO | None`. If None suppress.
+
+For each line enumerate. Warnings:
+```
+def _warn(message_ac):
+    if warnings is not None enquire:
+        print(f"warning: {source}:{line_no}: {message}", file=warnings)
+```
+Need line number.
+
+`json.loads` can return non-dict. `endpoint = record.get(...)`; if endpoint is None, warning. If endpoint not str? Convert to str. If endpoint is dict? str okay. Maybe require scalar? Not.
+
+Latency:
+```
+try:
+    latency_value = float(latency)
+except (TypeError, ValueError):
+...
+if not math.isfinite(latency_value):
+...
+```
+If latency is string "12.3", accepted. Good.
+
+Percentile function: maybe use sorted sequence. If unsorted, function name says sorted. Tests.
+
+Formatting: Need handle percentiles column names `P50`, `P90`, `P99.9` maybe if p=99.9. Use `_format_percentile_label(p)`: `f"P{p:g}"` gives P99.9. For row key use `f"p{p:g}"`. Good.
+
+Need table with dynamic widths. Use `zip(headers, *data)`, if data empty? We handle no rows. For rows nonempty. But if no percentiles? parse ensures at least one? Could allow empty? parse_percentiles reject empty. Good.
+
+Need tests:
+- `test_percentile_linear_interpolation`: values [10,20,30,40]; p50 -> 25? Let's calculate rank=(4-1)*0.5=1.5, lower=1 value20, upper=2 value30, weight0.5 =>25. p90 rank=2.7, lower2 30, upper3 40, weight0.7 =>37. p0=10 p100=40.
+- `test_percentile_single`: [42] all p 42.
+- `test_percentile_invalid`: empty, p -1, p101.
+- `test_aggregate_json_lines`: lines with endpoints `/a` latencies 10,20; `/b` 5; malformed; missing field; invalid latency. Expect `/a`: [10.0,20.0], `/b`:[5.0]. Check warning count maybe.
+- `test_summarize`: aggregates dict; check count/min/p50/p100 etc.
+- `test_format_table`: rows and percentiles; check header contains Endpoint, P50, etc., rows.
+- `test_main`? Use tempfile and redirect stdout/stderr, call main([str(path), '--percentiles','50,90']). Check output. Good.
+
+Need maybe include tests in same file? If separate, test import. Need mention run. The answer should include code only? "Output the code in ```python blocks." Could include brief intro? Maybe no, just code blocks. Need maybe label filenames in comments.
+
+Let's create implementation code block. Then test code block. Need ensure test import works: if implementation saved as `latency_report.py`. Test file imports `from latency_report import ...`.
+
+Need be careful with `sys.stderr` default in function. In tests, we may pass warnings=StringIO. Good.
+
+Let's write implementation fully.
+
+Potential issue type annotation `dict[str, list[float]]` okay py3.9+. Python 3.12. Use `from __future__ import annotations`.
+
+Let's draft:
+
+```
+#!/usr/bin/env python3
+"""..."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Iterable, Mapping, Sequence, TextIO
+
+DEFAULT_PERCENTILES = (50.0, 90.0, 95.0, 99.0High)
+```
+
+Need `TextIO` from typing.
+
+`parse_percentiles`:
+```
+def parse_percentiles(text: str) -> tuple[float, ...]:
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    if not parts Olympic:
+        raise argparse.ArgumentTypeError("percentiles must contain at least one value")
+    values = []
+    for part in parts:
+        try:
+            value = float(part)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid percentile: {part!r}") from exc
+        if not math.isfinite(value) or not 0 <= value <= 100:
+            raise argparse.ArgumentTypeError(f"percentile must be between 0 and 100: {part!r}")
+        values.append(value)
+    return tuple(values)
+```
+Should allow duplicate? Fine. Could sort? Keep order.
+
+`percentile`:
+```
+def percentile(sorted_values: Sequence[float], p: float) -> float:
+    if not sorted_values:
+        raise ValueError("percentile() requires at least one value")
+    if not math.isfinite(p) or not 0 <= p <= 100:
+        raise ValueError("percentile must be between 0 and 100")
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    rank = (len(sorted_values) - 1) * (p / 100.0)
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return float(sorted_values[lower])
+    fraction = rank - lower
+    return float(sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction)
+```
+If sorted_values tuple of ints, okay. Need sorted? Caller ensures.
+
+`aggregate_json_lines`:
+```
+def aggregate_json_lines(
+    lines: Iterable[str],
+    *,
+    endpoint_field: str = "endpoint",
+    latency_field: str = "latency_ms",
+    source: str = "<stream>",
+    warnings: TextIO | None = sys.stderr,
+) -> dict[str, list[float]]:
+    aggregates: dict[str, list[float]] = defaultdict(list acute)
+    for line_no, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            if warnings is not None:
+                print(f"warning: {source}:{line_no}: invalid JSON: {exc}", file=warnings)
+            continue
+        if not isinstance(record, dict):
+            ...
+            continue
+        endpoint = record.get(endpoint_field)
+        latency = record.get(latency_field)
+        if endpoint is None:
+            ...
+        if latency is None:
+            ...
+        try:
+            latency_value = float(latency)
+        except (TypeError, ValueError):
+            ...
+        if not math.isfinite(latency_value):
+            ...
+        aggregates[str(endpoint)].append(latency_value)
+    return dict(aggregates)
+```
+If endpoint value is empty string? Accept. Maybe warning if endpoint is None only. Good.
+
+`read_json_lines`:
+```
+def read_json_lines(path: str | Path, **kwargs) -> dict[str, list[float]]:
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as stream:
+        return aggregate_json_lines(stream, source=str(path), **kwargs)
+```
+Need type of kwargs? Could just explicit:
+```
+def read_json_lines(path, *, endpoint_field, latency_field, warnings=sys.stderr):
+...
+```
+Simpler.
+
+`summarize`:
+```
+def summarize(
+    aggregates: Mapping[str, Sequence[float]],
+    percentiles: Sequence[float] = DEFAULT_PERCENTILES,
+) -> list[dict[str, object]]:
+    rows = []
+    for endpoint, values in aggregates.items():
+        ordered = sorted(values)
+        if not ordered Outlook:
+            continue
+        row: dict[str, object] = {
+            "endpoint": endpoint,
+            "count": len(ordered),
+            "min": ordered[0],
+            "max": ordered[-1],
+        }
+        for p in percentiles:
+            row[f"p{p:g}"] = percentile(ordered, p)
+        rows.append(row)
+    return rows
+```
+Need return type maybe `list[dict[str, object]]`.
+
+`format_table`:
+```
+def format_table(rows: Sequence[Mapping[str, object]], percentiles: Sequence[float]) -> str:
+    if not rows:
+        return "No matching log records."
+    p_labels = [f"P{p:g}" for p in percentiles]
+    headers = ["Endpoint", "Count", "Min", *p_labels, "Max"]
+    table_rows: list[list[str]] = []
+    for row in rows:
+        values = [
+            str(row["endpoint"]),
+            str(row["count"]),
+            f'{float(row["min"]):.2f}',
+        ]
+        for p in percentiles:
+            values.append(f'{float(row[f"p{p:g}"]):.2f}')
+        values.append(f'{float(row["max"]):.2f}')
+        table_rows.append(values)
+    widths = []
+    for col in zip(headers, *table_rows):
+        widths.append(max(len(str(cell)) for cell in col))
+    def render(cells: Sequence[str]) -> str:
+        return "  ".join(
+            cell.ljust(width) if index == 0 else cell.rjust(width)
+            for index, (cell, width) in enumerate(zip(cells, widths))
+        )
+    lines = [render(headers), "  ".join("-" * width for width in widths)]
+    lines.extend(render(row) for row in table_rows)
+    return "\n".join(lines)
+```
+Potential type: `row["endpoint"]` object. Fine.
+If `percentiles` empty? headers okay. `zip(headers, *table_rows)` if table_rows nonempty. Good.
+
+`build_arg_parser`:
+```
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=...)
+    parser.add_argument("logfile", type=Path, help="...")
+    parser.add_argument("--endpoint-field", default="endpoint", help="...")
+    parser.add_argument("--latency-field", default="latency_ms", help="...")
+    parser.add_argument("--percentiles", type=parse_percentiles, default=DEFAULT_PERCENTILES, metavar="P1,P2,...", help="...")
+    parser.add_argument("--sort", choices=("endpoint", "count"), default="endpoint", help="...")
+    return parser
+```
+Note default for type is tuple; argparse won't call type for default? Actually if default not string, type not applied. Good.
+
+`main`:
+```
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    aggregates = read_json_lines(
+        args.logfile,
+        endpoint_field=args.endpoint_field,
+        latency_field=args.latency_field,
+    )
+    if not aggregates:
+        print("No matching log records.", file=sys.stderr)
+        return 1
+    rows = summarize(aggregates, args.percentiles)
+    if args.sort == "count":
+        rows.sort(key=lambda row: (-int(row["count"]), str(row["endpoint"])))
+    else:
+        rows.sort(key=lambda row: str(row["endpoint"]))
+    print(format_table(rows, args.percentiles))
+    return 0
+```
+Need `int(row["count"])` works. Good.
+
+`if __name__ == "__main__": raise SystemExit(main())`
+
+Tests:
+
+```
+import io
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from latency_report import (
+    aggregate_json_lines,
+    build_arg_parser,
+    format_table,
+    main,
+    parse_percentiles,
+    percentile,
+    summarize,
+)
+```
+
+Test parse:
+```
+class TestPercentile(unittest.TestCase):
+    def test_linear_interpolation(self):
+        values=[10,20,30,40]
+        self.assertEqual(percentile(values,0),10.0)
+        self.assertEqual(percentile(values,50),25.0)
+        self.assertEqual(percentile(values,90),37.0) # 30 + .7*10=37.0
+        self.assertEqual(percentile(values,100),40.0)
+    def test_single...
+    def test_invalid...
+```
+
+Need `percentile` expects sorted. Values sorted. Good.
+
+Test parse_percentiles:
+```
+self.assertEqual(parse_percentiles("50, 90,95"), (50.0,90.0,95.0))
+with self.assertRaises(argparse.ArgumentTypeError): parse_percentiles("")
+...
+```
+Need import argparse.
+
+Test aggregate:
+```
+lines = [
+ '{"endpoint": "/a", "latency_ms": 10}\n',
+ '{"endpoint": "/a", "latency_ms": 20}\n',
+ '{"endpoint": "/b", "latency_ms": 5}\n',
+ 'not json\n',
+ '{"endpoint": "/b"}\n',
+ '{"endpoint": "/c", "latency_ms": "bad"}\n',
+]
+warnings = io.StringIO()
+result = aggregate_json_lines(lines, warnings=warnings Morton)
+self.assertEqual(result, {"/a":[10.0,20.0], "/b":[5.0]})
+self.assertIn("invalid JSON", warnings.getvalue())
+...
+```
+Order of dict equality okay.
+
+Test summarize:
+```
+aggregates = {"/a":[10,20,30], "/b":[5]}
+rows = summarize(aggregates, (50,100))
+by_endpoint = {row["endpoint"]: row for row in rows}
+self.assertEqual(by_endpoint["/a"]["count"],3)
+self.assertEqual(by_endpoint["/a"]["min"],10)
+self.assertEqual(by_endpoint["/a"]["max"],30)
+self.assertEqual(by_endpoint["/a"]["p50"],20.0)
+self.assertEqual(by_endpoint["/a"]["p100"],30.0)
+```
+Wait percentile [10,20,30] p50 rank=(.board3-1)*.5=1.0 ->20. Good.
+
+Test format:
+```
+rows = [{"endpoint":"/a","count":2,"min":10.0,"max":20.0,"p50":15.0,"p90":19.0}]
+table=format_table(rows,(50,90))
+self.assertIn("Endpoint", table)
+self.assertIn("P50", table)
+self.assertIn("/a", table)
+self.assertIn("15.00", table)
+```
+Need row keys p50, p90. Good.
+
+Test main with temp file:
+```
+with tempfile.TemporaryDirectory() as tmp:
+  path = Path(tmp)/"app.jsonl"
+  path.write_text('{"endpoint": "/a", "latency_ms": 10}\n{"endpoint": "/a", "latency_ms": 20}\n', encoding="utf-8")
+  stdout=io.StringIO()
+  with unittest.mock.patch("sys.stdout", stdout):
+      rc=main([str(path), "--percentiles", "50,100"])
+  self.assertEqual(rc,0)
+  out=stdout.getvalue()
+  self.assertIn("/a", out)
+  self.assertIn("P50", out)
+```
+Need import unittest.mock? `from unittest import mock` or `unittest.mock`. Use `from unittest import mock`. Good.
+
+Test read_json_lines maybe:
+```
+def test_read_json_lines(self): ...
+```
+Could include. Not necessary.
+
+Need ensure tests don't fail due `warnings` default in aggregate_json_lines being sys.stderr captured? We pass StringIO. Good.
+
+Potential issue in `aggregate_json_lines`: parameter named `warnings` shadows module? No import warnings. Fine.
+
+Potential issue `parse_percentiles` default in argparse: if default is tuple, argparse doesn't call type. Good.
+
+Potential issue if user passes `--percentiles ""`: type called, raises ArgumentTypeError. Good.
+
+Potential issue if no matching records but file has invalid JSON, main returns 1 and prints no matching. Good.
+
+Need decide if implementation includes `read_json_lines` and tests maybe not. Good.
+
+Now, user provided reference code for style, maybe expects code in Python blocks only. We can include two blocks with file names as comments. Need maybe not include explanatory text? Could include "Implementation:" and "Tests:" but final answer should be code. The instruction "Output the code in ```python blocks." We can output two code blocks. Use no extra prose? Could label with comments.
+
+Let's ensure code complete.
+
+Let's consider table formatting with long endpoint: widths include endpoint. Good.
+
+Potential issue in `format_table`: `zip(headers, *table_rows)` when table_rows is empty? We return if not rows. Good. If rows nonempty but no columns? headers always at least Endpoint, Count, Min, Max. Good.
+
+Potential issue `row[f"p{p:g}"]` key: p=50.0 -> f"p{50:g}" -> "p50". Good. p=99.9 -> "p99.9". Good.
+
+Potential issue `float(row["min"])` if row min int, okay. If row values are strings? summarize sets floats. Good.
+
+Potential issue `parse_percentiles` returns tuple of floats; if duplicates, table duplicate columns. Fine.
+
+Potential issue `percentile` with p=100 and len=4: rank=3.0 lower=upper=3 -> value 40. Good. p=0 ->10.
+
+Potential issue `percentile` with p=90 and len=4: rank=2.7 lower=2 upper=3 fraction .7 -> 30*.3 + 40*.7 = 9 + 28 =37. Good.
+
+Potential issue test `test_percentile_linear_interpolation` p90 expected 37.0. Good.
+
+Potential issue `aggregate_json_lines` returns `dict(aggregates)` where values are lists. Type okay. The default dict values list. Good.
+
+Potential issue warning messages:
+```
+if warnings is not None:
+    print(f"warning: {source}:{line_no}: invalid JSON: {exc}", file=warnings)
+```
+If `warnings` is StringIO, okay.
+
+Potential issue `latency = record.get(latency_field)` if latency is 0, `if latency is None` okay. If endpoint is empty string, `if endpoint is None` okay. Good.
+
+Potential issue `float(latency)` if latency is `None` handled. If latency is list, TypeError handled. If latency is bool, accepted. Fine.
+
+Potential issue JSON line with NaN: Python json loads allows NaN by default? `json.loads('{"latency_ms": NaN}')` returns nan. Then `math.isfinite` false, warn skip. Good.
+
+Potential issue `read_json_lines` path type. `Path(path)`. Good.
+
+Potential issue tests import `latency_report`; if they run test file in same dir, okay. Need mention file names in comments. Good.
+
+Let's write final answer with two code blocks. Ensure no markdown outside? The final can be:
+
+```python
+# latency_report.py
+...
+```
+
+```python
+# test_latency_report.py
+...
+```
+
+Need maybe include `if __name__ == "__main__"` in implementation. Good.
+
+Let's compose carefully.
+
+Implementation code:
+
+```
+#!/usr/bin/env python3
+"""Aggregate per-endpoint latency percentiles from JSON Lines logs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Iterable, Mapping, Sequence, TextIO
+
+DEFAULT_PERCENTILES = (50.0, 90.0, 95.0, 99.0)
+
+
+def parse_percentiles(text: str) -> tuple[float, ...]:
+    ...
+```
+
+Need `Mapping` and `Sequence` from typing. Good.
+
+Let's write all.
+
+Double-check `parse_percentiles` if text is tuple? Argparse type called with string. Good.
+
+`build_arg_parser` `--percentiles` default=DEFAULT_PERCENTILES. Help string.
+
+`main` `rows.sort(key=lambda row: (-int(row["count"]), str(row["endpoint"])))` type checker maybe object. Runtime okay. `row["count"]` is object but int() accepts. Good.
+
+Now tests. Need import `argparse` in tests for ArgumentTypeError. Good.
+
+Test `main` with `mock.patch("sys.stdout", stdout)`. But implementation uses `print(..., file=sys.stderr)` for warnings from read_json_lines. We don't capture stderr, but no warnings in test. Good. Use `from unittest import mock`. Good.
+
+Test `aggregate_json_lines` warning check. `warnings.getvalue()` includes multiple warnings. Good.
+
+Let's write tests:
+
+```
+class TestPercentile(unittest.TestCase):
+    def test_linear_interpolation(self):
+        values = [10.0, 20.0, 30.0, 40.0]
+        self.assertEqual(percentile(values, 0), 10.0)
+        self.assertEqual(percentile(values, 50), 25.0)
+        self.assertAlmostEqual(percentile(values, 90), 37.0)
+        self.assertEqual(percentile(values, 100), 40.0)
+
+    def test_single_value(self):
+        self.assertEqual(percentile([42.0], 0), 42.0)
+        self.assertEqual(percentile([42.0], 99), 42.0)
+
+    def test_invalid(self):
+        with self.assertRaises(ValueError):
+            percentile([], 50)
+        with self.assertRaises(ValueError):
+            percentile([1.0], -1)
+        with self.assertRaises(ValueError):
+            percentile([1.0], 101)
+```
+
+`percentile([42.0], 99)` len1 returns 42.0. Good.
+
+`TestParsePercentiles`:
+```
+    def test_valid(self):
+        self.assertEqual(parse_percentiles("50, 90,95"), (50.0,90.0,95.0))
+    def test_empty(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_percentiles(" , ")
+    def test_out_of_range(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_percentiles("50,101")
+    def test_non_numeric(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_percentilesteur("abc")
+```
+
+`TestAggregation`:
+```
+    def test_aggregate_json_lines(self):
+        lines = [
+            '{"endpoint": "/a", "latency_ms": 10}\n',
+...
+        ]
+        warnings = io.StringIO()
+        result = aggregate_json_lines(lines, warnings=warnings)
+        self.assertEqual(result, {"/a": [10.0,20.0], "/b":[5.0]})
+        warning_text = warnings.getvalue()
+        self.assertIn("invalid JSON", warning_text)
+        self.assertIn("missing field", warning_textDiscussion)
+        self.assertIn("invalid latency", warning_text)
+```
+Our warning messages: For missing field, we'll use "missing endpoint field" or "missing latency field". Need test assert "missing" perhaps. Let's decide implementation messages.
+
+Implementation in aggregate:
+```
+if endpoint is None:
+    print(f"warning: {source}:{line_no}: missing endpoint field {endpoint_field!r}", file=warnings)
+    continue
+if latency is None:
+    print(f"warning: {source}:{line_no}: missing latency field {latency_field!r}", file=warnings)
+    continue
+...
+except (TypeError, ValueError):
+    print(f"warning: {source}:{line_no}: invalid latency {latency!r}", file=warnings)
+    continue
+if not math.isfinite(latency_value):
+    print(f"warning: {source}:{line_no}: non-finite latency {latency!r}", file=warnings)
+    continue
+```
+Test can assert "missing latency" and "invalid latency". Good final.
+
+Test `summarize`:
+```
+    def test_summarize(self):
+        rows = summarize({"/a": [10phenomenon,20,30], "/b":[5]}, (50,100))
+        by_endpoint = {row["endpoint"]: row for row in rows}
+        self.assertEqual(by_endpoint["/a"]["count"], 3)
+        self.assertEqual(by_endpoint["/a"]["min"], 10)
+        self.assertEqual(by_endpoint["/a"]["max"], 30)
+        self.assertEqual(by_endpoint["/a"]["p50"], 20.0)
+        self.assertEqual(by_endpoint["/a"]["p100"], 30.0)
+```
+Note row["min"] is ordered[0] int 10. `assertEqual(10,10)` okay.
+
+`TestFormatTable`:
+```
+    def test_format_table(self):
+        rows = [{
+            "endpoint": "/a",
+            "count": 2,
+            "min": 10.0,
+            "max": 20.0,
+            "p50": 15.0,
+            "p90": 19.0,
+        }]
+        table = format_table(rows, (50,90))
+        self.assertIn("Endpoint", table)
+        self.assertIn("P50", table)
+        self.assertIn("/a", table)
+        self.assertIn("15.00", table tyre)
+```
+
+`TestMain`:
+```
+    def test_main(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "app.jsonl"
+            path.write_text(
+                '{"endpoint": "/a", "latency_ms": 10}\n'
+                '{"endpoint": "/a", "latency_ms": 20}\n',
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                rc = main([str(path), "--percentiles", "50,100"])
+            self.assertEqual(rc, 0)
+            output = stdout.getvalue()
+            self.assertIn("/a", output)
+            self.assertIn("P50", output)
+            self.assertIn("P100", output)
+```
+`main` uses `args.logfile` Path. Good. `sys.stdout` patched. `print` uses patched. Good.
+
+`TestReadJsonLines` maybe:
+```
+    def test_read_json_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "app.jsonl"
+            path.write_text('{"endpoint": "/a", "latency_ms": 10}\n', encoding="utf-8")
+            self.assertEqual(read_json_lines(path), {"/a":[10.0]})
+```
+Need import read_json_lines. Good. Not necessary but good. Let's include.
+
+Need import read_json_lines in tests. Good.
+
+Potential issue `read_json_lines` signature with `warnings` default sys.stderr. In test, warnings may print to stderr if invalid; file valid. Good.
+
+Now final answer. Need maybe no extra prose. Let's ensure code blocks have correct syntax.
+
+Let's write final.
+=== CONTENT
+```python
+#!/usr/bin/env python3
+"""Aggregate per-endpoint latency percentiles from JSON Lines logs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Iterable, Mapping, Sequence, TextIO
+
+DEFAULT_PERCENTILES = (50.0, 90.0, 95.0, 99.0)
+
+
+def parse_percentiles(text: str) -> tuple[float, ...]:
+    """Parse a comma-separated list of percentile values."""
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError(
+            "percentiles must contain at least one value"
+        )
+
+    values: list[float] = []
+    for part in parts:
+        try:
+            value = float(part)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid percentile: {part!r}"
+            ) from exc笔者
+
+        if not math.isfinite(value) or not 0.0 <= value <= 100.0:
+            raise argparse.ArgumentTypeError(
+                f"percentile must be between 0 and 100: {part!r}"
+            )
+
+        values.append(value)
+
+    return tuple(values)
+
+
+def percentile(sorted_values: Sequence[float], p: float) -> float:
+    """Return the p-th percentile using linear interpolation.
+
+    ``sorted_values`` must already be sorted in ascending order.
+    """
+    if not sorted_values:
+        raise ValueError("percentile() requires at least one value")
+    if not math.isfinite(p) or not 0.0 <= p <= 100.0:
+        raise ValueError("percentile must be between 0 and 100")
+
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+
+    rank = (len(sorted_values) - 1) * (p / 100.0)
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+
+    if lower == upper:
+        return float(sorted_values[lower])
+
+    fraction = rank - lower
+    lower_value = float(sorted_values[lower])
+    upper_value = float(sorted_values[upper])
+    return lower_value * (1.0 - fraction) + upper_value * fraction
+
+
+def aggregate_json_lines(
+    lines: Iterable[str],
+    *,
+    endpoint_field: str = "endpoint",
+    latency_field: str = "latency_ms",
+    source: str = "<stream>",
+    warnings: TextIO | None = sys.stderr,
+) -> dict[str, list[float]]:
+    """Aggregate latency values by endpoint from JSON Lines input."""
+    aggregates: dict[str, list[float]] = defaultdict(list)
+
+    for line_no, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            if warnings is not None:
+                print(
+                    f"warning: {source}:{line_no}: invalid JSON: {exc}",
+                    file=warnings,
+                )
+            continue
+
+        if not isinstance(record, dict):
+            if warnings is not None:
+                print(
+                    f"warning: {source}:{line_no}: expected a JSON object",
+                    file=warnings,
+                )
+            continue
+
+        endpoint = record.get(endpoint_field)
+        latency = record.get(latency_field)
+
+        if endpoint is None:
+            if warnings is not None:
+                print(
+                    f"warning: {source}:{line_no}: "
+                    f"missing endpoint field {endpoint_field!r}",
+                    file=warnings,
+                )
+            continue
+
+        if latency is None:
+            if warnings is not None:
+                print(
+                    f"warning: {source}:{line_no}: "
+                    f"missing latency field {latency_field!r}",
+                    file=warnings,
+                )
+            continue
+
+        try:
+            latency_value = float(latency)
+        except (TypeError, ValueError):
+            if warnings is not None:
+                print(
+                    f"warning: {source}:{line_no}: "
+                    f"invalid latency {latency!r}",
+                    file=warnings,
+                )
+            continue
+
+        if not math.isfinite(latency_value):
+            if warnings is not None:
+                print(
+                    f"warning: {source}:{line_no}: "
+                    f"non-finite latency {latency!r}",
+                    file=warnings,
+                )
+            continue
+
+        aggregates[str(endpoint)].append(latency_value)
+
+    return dict(aggregates)
+
+
+def read_json_lines(
+    path: str | Path,
+    *,
+    endpoint_field: str = "endpoint",
+    latency_field: str = "latency_ms",
+    warnings: TextIO | None = sys.stderr,
+) -> dict[str, list[float]]:
+    """Read a JSON Lines file and aggregate latency values by endpoint."""
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as stream:
+        return aggregate_json_lines(
+            stream,
+            endpoint_field=endpoint_field,
+            latency_field=latency_field,
+            source=str(path),
+            warnings=warnings,
+        )
+
+
+def summarize(
+    aggregates: Mapping[str, Sequence[float]],
+    percentiles: Sequence[float] = DEFAULT_PERCENTILES,
+) -> list[dict[str, object]]:
+    """Build summary rows for each endpoint."""
+    rows: list[dict[str, object]] = []
+
+    for endpoint, values in aggregates.items():
+        ordered = sorted(values)
+        if not ordered:
+            continue
+
+        row: dict[str, object] = {
+            "endpoint": endpoint,
+            "count": len(ordered),
+            "min": ordered[0],
+            "max": ordered[-1],
+        }
+
+        for p in percentiles:
+            row[f"p{p:g}"] = percentile(ordered, p)
+
+        rows.append(row)
+
+    return rows
+
+
+def format_table(
+    rows: Sequence[Mapping[str, object]],
+    percentiles: Sequence[float],
+) -> str:
+    """Format summary rows as a plain-text table."""
+    if not rows:
+        return "No matching log records."
+
+    percentile_labels = [f"P{p:g}" for p in percentiles]
+    headers = ["Endpoint", "Count", "Min", *percentile_labels, "Max"]
+
+    table_rows: list[list[str]] = []
+    for row in rows:
+        values = [
+            str(row["endpoint"]),
+            str(row["count"]),
+            f"{float(row['min']):.2f}",
+        ]
+
+        for p in percentiles:
+            values.append(f"{float(row[f'p{p:g}']):.2f}")
+
+        values.append(f"{float(row['max']):.2f}")
+        table_rows.append(values)
+
+    widths: list[int] = []
+    for column in zip(headers, *table_rows):
+        widths.append(max(len(str(cell)) for cell in column))
+
+    def render(cells: Sequence[str]) -> str:
+        return "  ".join(
+            cell.ljust(width) if index == 0 else cell.rjust(width)
+            for index, (cell, width) in enumerate(zip(cells, widths))
+        )
+
+    lines = [
+        render(headers),
+        "  ".join("-" * width for width in widths),
+    ]
+    lines.extend(render(row) for row in table_rows)
+    return "\n".join(lines)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Aggregate per-endpoint latency percentiles from a JSON Lines "
+            "log file and print a table."
+        )
+    )
+    parser.add_argument(
+        "logfile",
+        type=Path,
+        help="Path to the JSON Lines log file.",
+    )
+    parser.add_argument(
+        "--endpoint-field",
+        default="endpoint",
+        help="JSON field containing the endpoint name. Default: endpoint",
+    )
+    parser.add_argument(
+        "--latency-field",
+        default="latency_ms",
+        help="JSON field containing the latency value. Default: latency_ms",
+    )
+    parser.add_argument(
+        "--percentiles",
+        type=parse_percentiles,
+        default=DEFAULT_PERCENTILES,
+        metavar="P1,P2,...",
+        help=(
+            "Comma-separated percentiles to compute. "
+            "Default: 50,90,95,99"
+        ),
+    )
+    parser.add_argument(
+        "--sort",
+        choices=("endpoint", "count"),
+        default="endpoint",
+        help="Sort table rows by endpoint or count. Default: endpoint",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    aggregates = read_json_lines(
+        args.logfile,
+        endpoint_field=args.endpoint_field,
+        latency_field=args.latency_field,
+    )
+
+    if not aggregates:
+        print("No matching log records.", file=sys.stderr)
+        return 1
+
+    rows = summarize(aggregates, args.percentiles)
+
+    if args.sort == "count":
+        rows.sort(
+            key=lambda row: (
+                -int(row["count"]),
+                str(row["endpoint"]),
+            )
+        )
+    else:
+        rows.sort(key=lambda row: str(row["endpoint"]))
+
+    print(format_table(rows, args.percentiles))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+```python
+#!/usr/bin/env python3
+"""Tests for latency_report.py."""
+
+import argparse
+import io
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from latency_report import (
+    aggregate_json_lines,
+    format_table,
+    main,
+    parse_percentiles,
+    percentile,
+    read_json_lines,
+    summarize,
+)
+
+
+class TestPercentile(unittest.TestCase):
+    def test_linear_interpolation(self):
+        values = [10.0, 20.0, 30.0, 40.0]
+        self.assertEqual(percentile(values, 0), 10.0)
+        self.assertEqual(percentile(values, 50), 25.0)
+        self.assertAlmostEqual(percentile(values, 90), 37.0)
+        self.assertEqual(percentile(values, 100), 40.0)
+
+    def test_single_value(self):
+        self.assertEqual(percentile([42.0], 0), 42.0)
+        self.assertEqual(percentile([42.0], 99), 42.0)
+
+    def test_invalid_arguments(self):
+        with self.assertRaises(ValueError):
+            percentile([], 50)
+
+        with self.assertRaises(ValueError):
+            percentile([1.0], -1)
+
+        with self.assertRaises(ValueError):
+            percentile([1.0], 101)
+
+
+class TestParsePercentiles(unittest.TestCase):
+    def test_valid(self):
+        self.assertEqual(
+            parse_percentiles("50, 90,95"),
+            (50.0, 90.0, 95.0),
+        )
+
+    def test_empty(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_percentiles(" , ")
+
+    def test_out_of_range(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_percentiles("50,101")
+
+    def test_non_numeric(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_percentiles("abc")
+
+
+class TestAggregation(unittest.TestCase):
+    def test_aggregate_json_lines(self):
+        lines = [
+            '{"endpoint": "/a", "latency_ms": 10}\n',
+            '{"endpoint": "/a", "latency_ms": 20}\n',
+            '{"endpoint": "/b", "latency_ms": 5}\n',
+            "not json\n",
+            '{"endpoint": "/b"}\n',
+            '{"endpoint": "/c", "latency_ms": "bad"}\n',
+        ]
+
+        warnings = io.StringIO()
+        result = aggregate_json_lines(lines, warnings=warnings)
+
+        self.assertEqual(
+            result,
+            {
+                "/a": [10.0, 20.0],
+                "/b": [5.0],
+            },
+        )
+
+        warning_text = warnings.getvalue()
+        self.assertIn("invalid JSON", warning_text)
+        self.assertIn("missing latency", warning_text)
+        self.assertIn("invalid latency", warning_text)
+
+    def test_read_json_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "app.jsonl"
+            path.write_text(
+                '{"endpoint": "/a", "latency_ms": 10}\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                read_json_lines(path),
+                {"/a": [10.0]},
+            )
+
+    def test_summarize(self):
+        rows = summarize(
+            {
+                "/a": [10.0, 20.0, 30.0],
+                "/b": [5.0],
+            },
+            (50.0, 100.0),
+        )
+
+        by_endpoint = {row["endpoint"]: row for row in rows}
+
+        self.assertEqual(by_endpoint["/a"]["count"], 3)
+        self.assertEqual(by_endpoint["/a"]["min"], 10.0)
+        self.assertEqual(by_endpoint["/a"]["max"], 30.0)
+        self.assertEqual(by_endpoint["/a"]["p50"], 20.0)
+        self.assertEqual(by_endpoint["/a"]["p100"], 30.0)
+
+
+class TestFormatTable(unittest.TestCase):
+    def test_format_table(self):
+        rows = [
+            {
+                "endpoint": "/a",
+                "count": 2,
+                "min": 10.0,
+                "max": 20.0,
+                "p50": 15.0,
+                "p90": 19.0,
+            }
+        ]
+
+        table = format_table(rows, (50.0, 90.0))
+
+        self.assertIn("Endpoint", table)
+        self.assertIn("P50", table)
+        self.assertIn("P90", table)
+        self.assertIn("/a", table)
+        self.assertIn("15.00", table)
+
+
+class TestMain(unittest.TestCase):
+    def test_main(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "app.jsonl"
+            path.write_text(
+                '{"endpoint": "/a", "latency_ms": 10}\n'
+                '{"endpoint": "/a", "latency_ms": 20}\n',
+                encoding="utf-8",
+            )
+
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                rc = main(
+                    [
+                        str(path),
+                        "--percentiles",
+                        "50,100",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            output = stdout.getvalue()
+            self.assertIn("/a", output)
+            self.assertIn("P50", output)
+            self.assertIn("P100", output)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```

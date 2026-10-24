@@ -1,0 +1,96 @@
+{
+  "diagnostic_only": false,
+  "rank": 0,
+  "layer": 39,
+  "checks": [
+    {
+      "trial": 0,
+      "tokens": 1,
+      "local_max_abs_error": 0.0,
+      "reference_config": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+      "cache_configs": [
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+      ],
+      "tp2_max_abs_error": 0.0
+    },
+    {
+      "trial": 1,
+      "tokens": 1,
+      "local_max_abs_error": 0.0,
+      "reference_config": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+      "cache_configs": [
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+      ],
+      "tp2_max_abs_error": 0.0
+    },
+    {
+      "trial": 2,
+      "tokens": 3,
+      "local_max_abs_error": 0.0,
+      "reference_config": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+      "cache_configs": [
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+      ],
+      "tp2_max_abs_error": 0.0
+    },
+    {
+      "trial": 3,
+      "tokens": 7,
+      "local_max_abs_error": 0.0,
+      "reference_config": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+      "cache_configs": [
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+      ],
+      "tp2_max_abs_error": 0.0
+    },
+    {
+      "trial": 4,
+      "tokens": 1,
+      "local_max_abs_error": 0.0,
+      "reference_config": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+      "cache_configs": [
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+      ],
+      "tp2_max_abs_error": 0.0
+    },
+    {
+      "trial": 5,
+      "tokens": 17,
+      "local_max_abs_error": 0.0,
+      "reference_config": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+      "cache_configs": [
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+      ],
+      "tp2_max_abs_error": 0.0
+    },
+    {
+      "trial": 6,
+      "tokens": 128,
+      "local_max_abs_error": 0.0,
+      "reference_config": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+      "cache_configs": [
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+        "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+      ],
+      "tp2_max_abs_error": 0.0
+    }
+  ],
+  "stats": {
+    "cache_bytes": 150405376,
+    "expert_requests": 948,
+    "expert_misses": 940,
+    "expert_hits": 8,
+    "staged_bytes": 8397564148,
+    "read_seconds": 3.636439044494182,
+    "load_batches": 157,
+    "routing_chunks": 82,
+    "calls": 7,
+    "tokens": 158,
+    "host_call_seconds": 4.065291489241645
+  },
+  "peak_cuda_bytes": 3995053568
+}

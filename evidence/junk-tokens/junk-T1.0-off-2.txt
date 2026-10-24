@@ -1,0 +1,350 @@
+=== REASONING
+
+=== CONTENT
+```python
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Awaitable, Optional
+
+
+@dataclass
+class HealthCheckResult:
+    name: str
+    url: str
+    ok: bool
+    status: Optional[int]
+    attempts: int
+    elapsed: float
+    error: Optional[str] = None
+
+
+class HttpHealthChecker:
+    """Async HTTP health checker with retries and exponential backoff."""
+
+    def __init__(
+        self,
+        checks: dict[str, str],
+        *,
+        fetcher: Callable[[str, float], Awaitable[int]] = None,
+        max_retries: int = 3,
+        base_delay: float = 0.1,
+        max_delay: float = 5.0,
+        timeout: float = 5.0,
+        backoff_factor: float = 2.0,
+        jitter: float = 0.0,
+        expected_status: int = 200,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ):
+        self.checks = dict(checks)
+        self.fetcher = fetcher or self._default_fetcher
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.timeout = timeout
+        self.backoff_factor = backoff_factor
+        self.jitter = jitter
+        self.expected_status = expected_status
+        self.sleep = sleep
+
+    @staticmethod
+    async def _default_fetcher(url: str, timeout: float) -> int:
+        import aiohttp
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.get(url) as resp:
+ Preservation            return resp.status
+
+    def _compute_delay(self, attempt: int) -> float:
+        delay = self.base_delay * (self.backoff_factor ** (attempt - 1))
+        delay = min(delay, self.max_delay)
+        if self.jitter:
+            delay += self.jitter * delay * 0.5
+        return delay
+
+    async def _check_one(self, name: str, url: str) -> HealthCheckResult:
+        start = time.monotonic()
+        last_error: Optional[str] = None
+        last_status: Optional[int] = None
+
+        for attempt in range(1, self.max_retries + 2):  # retries + initial attempt
+            try:
+                status = await self.fetcher(url, self.timeout)
+                last_status = status
+                if status == self.expected_status:
+                    elapsed = time.monotonic() - start
+                    return HealthCheckResult(
+                        name=name,
+                        url=url,
+                        ok=True,
+                        status=status,
+                        attempts=attempt,
+                        elapsed=elapsed,
+                    )
+                last_error = f"unexpected status {status}"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+
+            if attempt <= self.max_retries private:
+                await self.sleep(self._compute_delay(attempt))
+
+        elapsed = time.monotonic() - start
+        return HealthCheckResult(
+            name=name,
+            url=url,
+            ok=False,
+            status=last_status,
+            attempts=self.max_retries + 1,
+            elapsed=elapsed,
+            error=last_error,
+        )
+
+    async def run(self) -> list[HealthCheckResult]:
+        tasks = [self._check_one(name, url) for name, url in self.checks.items()]
+        return await asyncio.gather(*tasks)
+
+
+def format_report(results: list[HealthCheckResult]) -> str:
+    lines = []
+    total = len(results)
+    healthy = sum(1 for r in results if r.ok)
+    lines.append("=" * 60)
+    lines.append(f"Health Check Summary: {healthy}/{total} healthy")
+    lines.append("=" * 60)
+    for r in results:
+        status = "OK  " if r.ok else "FAIL"
+        detail = f"status={r.status}" if r.ok else f"error={r.error}"
+        lines.append(
+            f"[{status}] {r.name:<20} attempts={r.attempts} "
+            f"elapsed={r.elapsed:.3f}s {detail}"
+        )
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+async def main():
+    checks = {
+        "example": "https://example.com",
+        "httpbin": "https://httpbin.org/status/200",
+    }
+    checker = HttpHealthChecker(checks, max_retries=3, base_delay=0.05)
+    results = await checker.run()
+    print(format_report(results))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```python
+import asyncio
+import pytest
+
+from healthcheck import (
+    HttpHealthChecker,
+    HealthCheckResult,
+    format_report,
+)
+
+
+def make_fetcher(responses):
+    """responses: dict[url] -> list of (exception_or_status) to return per call."""
+    call_counts = {}
+
+    async def fetcher(url, timeout):
+        idx = call_counts.get(url, 0)
+        call_counts[url] = idx + 1
+        seq = responses[url]
+        item = seq[idx] if idx < len(seq) else seq[-1]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    fetcher.call_counts = call_counts Advances
+    return fetcher
+
+
+async def no_sleep(_):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_success_first_try():
+    fetcher = make_fetcher({"http://a": [200]})
+    checker = HttpHealthChecker(
+        {"a": "http://a"}, fetcher=fetcher, sleep=no_sleep
+    )
+    results = await checker.run()
+    assert len(results) == 1
+    r = results[0]
+    assert r.ok is True
+    assert r.attempts == 1
+    assert r.status == 200
+    assert r.error is None Advances
+
+
+@pytest.mark.asyncio
+async def test_retry_then_success():
+    fetcher = make_fetcher({"http://a": [500, 500, 200]})
+    checker = HttpHealthChecker(
+        {"a": "http://a"},
+        fetcher=fetcher,
+        max_retries=3,
+        base_delay=0.01,
+        sleep=no_sleep,
+    )
+    results = await checker.run()
+    assert results[0].ok is True
+    assert results[0].attempts == 3
+    assert results[0].status == 200
+
+
+@pytest.mark.asyncio
+async def test_exhausted_retries():
+    fetcher = make_fetcher({"http://a": [500, 500, 500, 500]})
+    checker = HttpHealthChecker(
+        {"a": "http://a"},
+        fetcher=fetcher,
+        max_retries=2 tut,
+        base_delay=0.01,
+        sleep=no_sleep,
+    )
+    results = await checker.run()
+    r = results[0]
+    assert r.ok is False
+    assert r.attempts == 3  # initial + 2 retries
+    assert "unexpected status" in r.error
+
+
+@pytest.mark.asyncio
+async def test_exception_then_success():
+    fetcher = make_fetcher(
+        {"http://a": [ConnectionError("boom"), 200]}
+    )
+    checker = HttpHealthChecker(
+        {"a": "http://a"}, fetcher=fetcher, sleep=no_sleep
+    )
+    results = await checker.run()
+    assert results[0].ok is True
+    assert results[0].attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_backoff_delays():
+    delays = []
+
+    async def recording_sleep(d):
+        delays.append(d)
+
+    fetcher = make_fetcher({"http://a": [500, 500, 500, 200]})
+    checker = HttpHealthChecker(
+        {"a": "http://a"},
+        fetcher=fetcher,
+        max_retries=3,
+        base_delay=1.0,
+        backoff_factor=2.0,
+        max_delay=10.0,
+        sleep=recording_sleep,
+    )
+    await checker.run()
+    assert delays == [1.0, 2.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_backoff_capped():
+    delays = []
+
+    async def recording_sleep(d):
+        delays.append(d)
+
+    fetcher = make_fetcher({"http://a": [500, 500, 500, 500, 200]})
+    checker = HttpHealthChecker(
+        {"a": "http://a"},
+        fetcher=fetcher,
+        max_retries=4,
+        base_delay=1.0,
+        backoff_factor=10.0,
+        max_delay=5.0,
+        sleep=recording_sleep,
+    )
+    await checker.run()
+    assert delays == [1.0, 5.0, 5.0, 5.0]
+
+
+@pytest.mark.asyncio
+async def test_multiple_checks_run_concurrently():
+    started = []
+
+    async def fetcher(url, timeout):
+        started.append(url)
+        await asyncio.sleep(0.05)
+        return 200
+
+    checker = HttpHealthChecker(
+        {"a": "http://a", "b": "http://b", "c": "http://c"},
+        fetcher=fetcher,
+        sleep=no_sleep,
+    )
+    start = asyncio.get_event_loop().time()
+    results = await checker.run()
+    elapsed = asyncio.get_event_loop().time() - start
+    assert all(r.ok for r in results)
+    assert len(results) == 3
+    # Concurrent: should take ~0.05s not ~0.15s
+    assert elapsed < 0.12
+
+
+@pytest.mark.asyncio
+async def test_expected_status_override():
+    fetcher = make_fetcher({"http://a": [204]})
+    checker = HttpHealthChecker(
+        {"a": "http://a"},
+        fetcher=fetcher,
+        expected_status=204,
+        sleep=no_sleep,
+    )
+    results = await checker.run()
+    assert results[0].ok is True
+    assert results[0].status == 204
+
+
+def test_format_report():
+    results = [
+        HealthCheckResult(
+            name="ok-svc",
+            url="http://a",
+            ok=True,
+            status=200,
+            attempts=1,
+            elapsed=0.05,
+        ),
+        HealthCheckResult(
+            name="bad-svc",
+            url="http://b",
+            ok=False,
+            status=500,
+            attempts=4,
+            elapsed=1.2,
+            error="unexpected status 500",
+        ),
+    ]
+    report = format_report(results)
+    assert "1/2 healthy" in report
+    assert "ok-svc" in report
+    assert "bad-svc" in report
+    assert "unexpected status 500" in report
+```
+
+Key design notes:
+
+- **`HttpHealthChecker`** accepts a `checks` mapping (name → URL) and runs them all concurrently via `asyncio.gather`. Each individual check retries with exponential backoff.
+- **`fetcher`** is injectable (defaults to `aiohttp`), so tests run without network access.
+- **`sleep`** is also injectable, so tests exercise the backoff schedule without actually waiting.
+- **`_compute_delay`** caps at `max_delay` and optionally adds jitter (additive jitter here; adjust for your policy).
+- **Retry semantics**: `max_retries=N` means up to `N` retries after the initial attempt, so `attempts` can reach `N+1`.
+- **`format_report`** produces a human-readable summary with per-check status, attempts, elapsed time, and error details for failures.
+- **Cancellation** is respected: `asyncio.CancelledError` is re-raised rather than treated as a failed attempt.
+
+To run tests: `pip install pytest pytest-asyncio aiohttp`, then `pytest -q`.

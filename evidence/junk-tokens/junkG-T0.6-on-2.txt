@@ -1,0 +1,688 @@
+=== REASONING
+The user wants a Python asyncio HTTP health checker with retries, exponential backoff, and a summary report, plus tests. The prompt is a bit odd (the system message is a huge joke file), but the actual task is clear. Let me write clean code.
+
+Let me design:
+
+- `HealthChecker` class that takes a list of URLs, timeout, retries, base backoff.
+- Uses `aiohttp` or `httpx`? Let's use `aiohttp` — standard. Actually to avoid dependency issues, maybe use `httpx`? Both are third-party. `aiohttp` is common. Let's use `aiohttp`.
+
+Actually, to make tests easy without a real server, we can use `aiohttp`'s test utilities, or just spin up a local aiohttp server in tests. That's clean.
+
+Let me write:
+
+```python
+# healthcheck.py
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Sequence
+
+import aiohttp
+
+
+class Status(str, Enum):
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+
+
+@dataclass
+class CheckResult:
+    url: str
+    status: Status
+    attempts: int
+    latency_ms: float
+    status_code: int | None = None
+    error: str | None = None
+    history: list[float] = field(default_factory=list)  # latencies per attempt
+
+
+class HealthChecker:
+    def __init__(
+        self,
+        urls: Sequence[str],
+        *,
+        timeout: float = 5.0,
+        retries: int = 3,
+        base_backoff: float = 0.5,
+        max_backoff: float = 10.0,
+        expected_status: int = 200,
+        concurrency: int = 10,
+        session: aiohttp.ClientSession | None = None,
+    ):
+        ...
+```
+
+Implementation of `_check_one`:
+
+```python
+async def _check_one(self, session, url):
+    history = []
+    last_error = None
+    last_status = None
+    for attempt in range(1, self.retries + 1):
+        start = time.perf_counter()
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=self.timeout)) as resp:
+                last_status = resp.status
+                await resp.read()
+                latency = (time.perf_counter() - start) * 1000
+                history.append(latency)
+                if resp.status == self.expected_status:
+                    return CheckResult(url, Status.HEALTHY, attempt, latency, resp.status, None, history)
+                last_error = f"unexpected status {resp.status}"
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            latency = (time.perf_counter() - start) * 1000
+            history.append(latency)
+            last_error = f"{type(e).__name__}: {e}"
+        if attempt < self.retries:
+            delay = min(self.base_backoff * (2 ** (attempt - 1)), self.max_backoff)
+            await asyncio.sleep(delay)
+    return CheckResult(url, Status.UNHEALTHY, self.retries, history[-1] if history else 0.0, last_status, last_error, history)
+```
+
+Also a summary report function.
+
+And `run()` that uses a semaphore for concurrency.
+
+Tests with aiohttp test server (aiohttp.test_utils.TestServer) or just aiohttp.web app on a random port.
+
+Let me write tests using pytest + pytest-asyncio, or plain asyncio with unittest.IsolatedAsyncioTestCase. I'll use pytest-asyncio since it's common. Actually, to reduce dependency assumptions, maybe use `unittest.IsolatedAsyncioTestCase` — that's stdlib. But pytest is more common. Let me use pytest with `pytest.mark.asyncio`.
+
+Hmm, but the user said "plus tests". Let me provide pytest tests with aiohttp test server.
+
+Let me write a clean, complete solution.
+
+Also add a `main()` CLI entry point maybe. Keep it reasonable.
+
+Let me write the summary report:
+
+```python
+def format_report(results):
+    lines = []
+    healthy = sum(1 for r in results if r.status is Status.HEALTHY)
+    ...
+```
+
+Let me write it all out.
+
+For tests, I'll create a small aiohttp web app with endpoints:
+- `/ok` returns 200
+- `/flaky` returns 500 first N times then 200
+- `/fail` always 500
+- `/slow` sleeps longer than timeout
+
+Use `aiohttp.test_utils.TestServer` + `TestClient`. Actually with `HealthChecker` taking a session, we can pass the test client's session. But TestClient's session is created in `start_server`. Let's just use `aiohttp.test_utils.TestServer` and create our own session pointing at it.
+
+Simpler: use `TestClient` from `aiohttp.test_utils`:
+
+```python
+async with TestClient(TestServer(app)) as client:
+    checker = HealthChecker([str(client.make_url('/ok'))], session=client.session)
+```
+
+But `client.session` is created by TestClient. That works.
+
+Actually `TestClient` has `.session` after `start_server`. Yes.
+
+Let me write tests:
+
+```python
+import asyncio
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from healthcheck import HealthChecker, Status, format_report
+
+
+@pytest.fixture
+async def app_client():
+    state = {"flaky_calls": 0}
+
+    async def ok(request):
+        return web.Response(text="ok")
+
+    async def flaky(request):
+        state["flaky_calls"] += 1
+        if state["flaky_calls"] < 3:
+            return web.Response(status=500)
+        return web.Response(text="ok")
+
+    async def fail(request):
+        return web.Response(status=503)
+
+    async def slow(request):
+        await asyncio.sleep(2)
+        return web.Response(text="slow")
+
+    app = web.Application()
+    app.router.add_get("/ok", ok)
+    app.router.add_get("/flaky", flaky)
+    app.router.add_get("/fail", fail)
+    app.router.add_get("/slow", slow)
+
+    async with TestClient(TestServer(app)) as client:
+        yield client
+```
+
+Then tests use `client.make_url("/ok")`.
+
+Need `pytest-asyncio` with `asyncio_mode = auto` or mark each test. I'll add `pytestmark = pytest.mark.asyncio`.
+
+Let me write the final code.
+
+Also add retries backoff test: verify that a flaky endpoint that fails twice then succeeds is reported healthy with attempts=3.
+
+And a test for the report format.
+
+Let me write `format_report`:
+
+```python
+def format_report(results):
+    total = len(results)
+    healthy = sum(1 for r in results if r.status is Status.HEALTHY)
+    unhealthy = total - healthy
+    lines = [
+        "Health Check Report",
+        "===================",
+        f"Total: {total}  Healthy: {healthy}  Unhealthy: {unhealthy}",
+        "",
+    ]
+    for r in results:
+        if r.status is Status.HEALTHY:
+            lines.append(f"[ OK ] {r.url}  {r.status_code}  {r.latency_ms:.1f}ms  attempts={r.attempts}")
+        else:
+            lines.append(f"[FAIL] {r.url}  {r.status_code or '-'}  {r.latency_ms:.1f}ms  attempts={r.attempts}  error={r.error}")
+    return "\n".join(lines)
+```
+
+Also add `run()`:
+
+```python
+async def run(self):
+    sem = asyncio.Semaphore(self.concurrency)
+    async def guarded(url):
+        async with sem:
+            return await self._check_one(url)
+    if self.session is not None:
+        return await asyncio.gather(*(guarded(u) for u in self.urls))
+    async with aiohttp.ClientSession() as session:
+        self._session = session
+        return await asyncio.gather(*(guarded(u) for u in self.urls))
+```
+
+Hmm, better to have `_check_one` take session. Let me restructure:
+
+```python
+async def run(self):
+    if self._session is not None:
+        return await self._run_with(self._session)
+    async with aiohttp.ClientSession() as session:
+        return await self._run_with(session)
+
+async def _run_with(self, session):
+    sem = asyncio.Semaphore(self.concurrency)
+    async def guarded(url):
+        async with sem:
+            return await self._check_one(session, url)
+    return await asyncio.gather(*(guarded(u) for u in self.urls))
+```
+
+Good.
+
+Also add `check_all` alias? No, `run` is fine.
+
+Also `main()` for CLI:
+
+```python
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("urls", nargs="+")
+    parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--base-backoff", type=float, default=0.5)
+    parser.add_argument("--concurrency", type=int, default=10)
+    args = parser.parse_args(argv)
+    checker = HealthChecker(args.urls, timeout=args.timeout, retries=args.retries, base_backoff=args.base_backoff, concurrency=args.concurrency)
+    results = asyncio.run(checker.run())
+    print(format_report(results))
+    return 0 if all(r.status is Status.HEALTHY for r in results) else 1
+```
+
+Now let me write the full file cleanly.
+
+One thing: `aiohttp.ClientTimeout(total=self.timeout)` — timeout applies per request. Good.
+
+For the `slow` test, timeout=0.2, retries=2, base_backoff=0.01 → should be unhealthy with TimeoutError.
+
+For the flaky test, retries=3, base_backoff=0.01 → attempts=3, healthy.
+
+Let me also test that `history` has the right length.
+
+Also test the report contains the URL.
+
+Let me finalize.
+
+One more consideration: `aiohttp.ClientSession` should be created inside the event loop. In tests, we pass `client.session` which is already in the loop. Good.
+
+Also, `asyncio.gather` with `return_exceptions=False` — but `_check_one` catches exceptions, so fine.
+
+Let me write it.
+
+Actually for the test fixture, `TestClient` needs `await client.start_server()` — the async context manager does that. Good.
+
+Also `client.make_url("/ok")` returns a `yarl.URL`; convert to str.
+
+Let me write the final answer.
+
+I'll also add a `pyproject.toml` snippet? Maybe just mention deps. Keep it focused: healthcheck.py + test_healthcheck.py.
+
+Let me write the code.
+
+```python
+# healthcheck.py
+"""Async HTTP health checker with retries, exponential backoff, and reporting."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Iterable, Sequence
+
+import aiohttp
+
+
+class Status(str, Enum):
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+
+
+@dataclass
+class CheckResult:
+    url: str
+    status: Status
+    attempts: int
+    latency_ms: float
+    status_code: int | None = None
+    error: str | None = None
+    history_ms: list[float] = field(default_factory=list)
+
+
+class HealthChecker:
+    def __init__(
+        self,
+        urls: Sequence[str],
+        *,
+        timeout: float = 5.0,
+        retries: int = 3,
+        base_backoff: float = 0.5,
+        max_backoff: float = 10.0,
+        expected_status: int = 200,
+        concurrency: int = 10,
+        session: aiohttp.ClientSession | None = None,
+    ) -> None:
+        if retries < 1:
+            raise ValueError("retries must be >= 1")
+        if concurrency < 1:
+            raise ValueError("concurrency must be >= 1")
+        self.urls = list(urls)
+        self.timeout = timeout
+        self.retries = retries
+        self.base_backoff = base_backoff
+        self.max_backoff = max_backoff
+        self.expected_status = expected_status
+        self.concurrency = concurrency
+        self._session = session
+
+    def _backoff(self, attempt: int) -> float:
+        # attempt is 1-based; delay before the next try
+        return min(self.base_backoff * (2 ** (attempt - 1)), self.max_backoff)
+
+    async def _check_one(self, session: aiohttp.ClientSession, url: str) -> CheckResult:
+        history: list[float] = []
+        last_error: str | None = None
+        last_status: int | None = None
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+
+        for attempt in range(1, self.retries + 1):
+            start = time.perf_counter()
+            try:
+                async with session.get(url, timeout=timeout) as resp:
+                    last_status = resp.status
+                    await resp.read()
+                    latency = (time.perf_counter() - start) * 1000.0
+                    history.append(latency)
+                    if resp.status == self.expected_status:
+                        return CheckResult(
+                            url=url,
+                            status=Status.HEALTHY,
+                            attempts=attempt,
+                            latency_ms=latency,
+                            status_code=resp.status,
+                            history_ms=history,
+                        )
+                    last_error = f"unexpected status {resp.status}"
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                latency = (time.perf_counter() - start) * 1000.0
+                history.append(latency)
+                last_error = f"{type(exc).__name__}: {exc}"
+
+            if attempt < self.retries:
+                await asyncio.sleep(self._backoff(attempt))
+
+        return CheckResult(
+            url=url,
+            status=Status.UNHEALTHY,
+            attempts=self.retries,
+            latency_ms=history[-1] if history else 0.0,
+            status_code=last_status,
+            error=last_error,
+            history_ms=history,
+        )
+
+    async def _run_with(self, session: aiohttp.ClientSession) -> list[CheckResult]:
+        sem = asyncio.Semaphore(self.concurrency)
+
+        async def guarded(url: str) -> CheckResult:
+            async with sem:
+                return await self._check_one(session, url)
+
+        return await asyncio.gather(*(guarded(u) for u in self.urls))
+
+    async def run(self) -> list[CheckResult]:
+        if self._session is not None:
+            return await self._run_with(self._session)
+        async with aiohttp.ClientSession() as session:
+            return await self._run_with(session)
+
+
+def format_report(results: Iterable[CheckResult]) -> str:
+    results = list(results)
+    total = len(results)
+    healthy = sum(1 for r in results if r.status is Status.HEALTHY)
+    unhealthy = total - healthy
+    lines = [
+        "Health Check Report",
+        "===================",
+        f"Total: {total}  Healthy: {healthy}  Unhealthy: {unhealthy}",
+        "",
+    ]
+    for r in results:
+        if r.status is Status.HEALTHY:
+            lines.append(
+                f"[ OK ] {r.url}  status={r.status_code}  "
+                f"latency={r.latency_ms:.1f}ms  attempts={r.attempts}"
+            )
+        else:
+            lines.append(
+                f"[FAIL] {r.url}  status={r.status_code or '-'}  "
+                f"latency={r.latency_ms:.1f}ms  attempts={r.attempts}  "
+                f"error={r.error}"
+            )
+    return "\n".join(lines)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Async HTTP health checker")
+    parser.add_argument("urls", nargs="+", help="URLs to check")
+    parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--base-backoff", type=float, default=0.5)
+    parser.add_argument("--max-backoff", type=float, default=10.0)
+    parser.add_argument("--concurrency", type=int, default=10)
+    parser.add_argument("--expected-status", type=int, default=200)
+    args = parser.parse_args(argv)
+
+    checker = HealthChecker(
+        args.urls,
+        timeout=args.timeout,
+        retries=args.retries,
+        base_backoff=args.base_backoff,
+        max_backoff=args.max_backoff,
+        concurrency=args.concurrency,
+        expected_status=args.expected_status,
+    )
+    results = asyncio.run(checker.run())
+    print(format_report(results))
+    return 0 if all(r.status is Status.HEALTHY for r in results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+Now tests:
+
+```python
+# test_healthcheck.py
+import asyncio
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from healthcheck import HealthChecker, Status, format_report
+
+pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture
+async def client():
+    state = {"flaky_calls": 0}
+
+    async def ok(request):
+        return web.Response(text="ok")
+
+    async def flaky(request):
+        state["flaky_calls"] += 1
+        if state["flaky_calls"] < 3:
+            return web.Response(status=500)
+        return web.Response(text="ok")
+
+    async def fail(request):
+        return web.Response(status=503)
+
+    async def slow(request):
+        await asyncio.sleep(2)
+        return web.Response(text="slow")
+
+    app = web.Application()
+    app.router.add_get("/ok", ok)
+    app.router.add_get("/flaky", flaky)
+    app.router.add_get("/fail", fail)
+    app.router.add_get("/slow", slow)
+
+    async with TestClient(TestServer(app)) as c:
+        yield c
+
+
+async def test_healthy(client):
+    checker = HealthChecker([str(client.make_url("/ok"))], session=client.session)
+    [result] = await checker.run()
+    assert result.status is Status.HEALTHY
+    assert result.status_code == 200
+    assert result.attempts == 1
+    assert len(result.history_ms) == 1
+
+
+async def test_retries_then_success(client):
+    checker = HealthChecker(
+        [str(client.make_url("/flaky"))],
+        retries=3,
+        base_backoff=0.01,
+        session=client.session,
+    )
+    [result] = await checker.run()
+    assert result.status is Status.HEALTHY
+    assert result.attempts == 3
+    assert len(result.history_ms) == 3
+
+
+async def test_unhealthy_after_retries(client):
+    checker = HealthChecker(
+        [str(client.make_url("/fail"))],
+        retries=2,
+        base_backoff=0.01,
+        session=client.session,
+    )
+    [result] = await checker.run()
+    assert result.status is Status.UNHEALTHY
+    assert result.attempts == 2
+    assert result.status_code == 503
+    assert "unexpected status 503" in result.error
+
+
+async def test_timeout(client):
+    checker = HealthChecker(
+        [str(client.make_url("/slow"))],
+        timeout=0.1,
+        retries=2,
+        base_backoff=0.01,
+        session=client.session,
+    )
+    [result] = await checker.run()
+    assert result.status is Status.UNHEALTHY
+    assert result.attempts == 2
+    assert "TimeoutError" in result.error
+
+
+async def test_concurrent_mixed(client):
+    urls = [
+        str(client.make_url("/ok")),
+        str(client.make_url("/fail")),
+        str(client.make_url("/ok")),
+    ]
+    checker = HealthChecker(
+        urls, retries=2, base_backoff=0.01, concurrency=3, session=client.session
+    )
+    results = await checker.run()
+    assert len(results) == 3
+    assert [r.status for r in results] == [
+        Status.HEALTHY,
+        Status.UNHEALTHY,
+        Status.HEALTHY,
+    ]
+
+
+async def test_report_contains_urls_and_counts(client):
+    checker = HealthChecker(
+        [str(client.make_url("/ok")), str(client.make_url("/fail"))],
+        retries=1,
+        session=client.session,
+    )
+    results = await checker.run()
+    report = format_report(results)
+    assert "Total: 2" in report
+    assert "Healthy: 1" in report
+    assert "Unhealthy: 1" in report
+    assert str(client.make_url("/ok")) in report
+    assert str(client.make_url("/fail")) in report
+
+
+async def test_backoff_schedule():
+    checker = HealthChecker([], base_backoff=0.5, max_backoff=2.0)
+    assert [checker._backoff(i) for i in range(1, 6)] == [0.5, 1.0, 2.0, 2.0, 2.0]
+
+
+async def test_invalid_args():
+    with pytest.raises(ValueError):
+        HealthChecker(["http://x"], retries=0)
+    with pytest.raises(ValueError):
+        HealthChecker(["http://x"], concurrency=0)
+```
+
+Hmm, `test_backoff_schedule` and `test_invalid_args` don't need async. But `pytestmark = pytest.mark.asyncio` applies to all. That's fine, pytest-asyncio handles it. Actually it's fine to have async tests that don't await.
+
+Wait — `checker._backoff(i)` for i=1..5 with base=0.5, max=2.0: 0.5*2^0=0.5, 0.5*2^1=1.0, 0.5*2^2=2.0, 0.5*2^3=4.0→min 2.0, 0.5*2^4=8.0→2.0. So [0.5, 1.0, 2.0, 2.0, 2.0]. Correct.
+
+Also need to ensure `test_concurrent_mixed` order is preserved — `asyncio.gather` preserves order. Good.
+
+For `test_timeout`, `aiohttp` timeout raises `asyncio.TimeoutError` (which in 3.11+ is `TimeoutError`). `type(exc).__name__` would be "TimeoutError". Good. Actually in Python 3.11+, `asyncio.TimeoutError` is an alias for builtin `TimeoutError`. `type(exc).__name__` → "TimeoutError". Good.
+
+But wait — `aiohttp.ClientTimeout(total=0.1)` raises `asyncio.TimeoutError`? Yes, aiohttp raises `asyncio.TimeoutError` on total timeout. Good.
+
+Also, `aiohttp` might raise `ServerTimeoutError` (subclass of `ClientError`) for read timeout. For total timeout it's `asyncio.TimeoutError`. Both are caught.
+
+Now, one concern: `test_timeout` with `timeout=0.1` and server sleeping 2s — the server request handler will still be running after the client disconnects. That's fine, but the TestServer teardown might wait. Actually aiohttp will cancel it. Should be fine.
+
+Actually, there might be a "Task was destroyed but it is pending" warning. To be safe, maybe use a shorter sleep like 0.5 and timeout 0.05. Still fine.
+
+Let me also add a `conftest.py` note about `asyncio_mode = auto`? Or just use `pytestmark`. `pytestmark = pytest.mark.asyncio` requires `pytest-asyncio` in strict mode (default). That works.
+
+Actually in newer pytest-asyncio, `pytest.mark.asyncio` works in strict mode. Good.
+
+Let me also add a `requirements.txt` or note.
+
+Also add `pyproject.toml` config for pytest-asyncio? Optional. I'll mention it.
+
+Let me finalize the answer with two files: `healthcheck.py` and `test_healthcheck.py`, plus a short note on running.
+
+Also maybe add `__all__`.
+
+I think this is good. Let me also double check the `format_report` when `status_code` is None — `r.status_code or '-'` gives '-'. Good.
+
+One more: in `_check_one`, if `resp.status != expected`, we set `last_error` but continue. On the final attempt, we return with `last_error` set. Good.
+
+Also, `history_ms` is passed as the same list object — that's fine since we return immediately.
+
+Let me also make sure `CheckResult` uses `field(default_factory=list)` — yes.
+
+Final answer.
+=== CONTENT
+# Async HTTP Health Checker
+
+Two files: the checker itself, and a test suite that spins up a real `aiohttp` server (no mocking) so retries, timeouts, and backoff are exercised end-to-end.
+
+## `healthcheck.py`
+
+```python
+"""Async HTTP health checker with retries, exponential backoff, and a summary report."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Iterable, Sequence
+
+import aiohttp
+
+
+class Status(str, Enum):
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+
+
+@dataclass
+class CheckResult:
+    url: str
+    status: Status
+    attempts: int
+    latency_ms: float
+    status_code: int | None = None
+    error: str | None = None
+    history_ms: list[float] = field(default_factory=list)
+
+
+class HealthChecker:
+    def __init__(
+        self,
+        urls: Sequence[str],
+        *,
+        timeout: float = 5.0,
+        retries: int = 3,
+        base_backoff: float = 0.5,
+        max_backoff: float = 10.0,
+        expected_status: int = 200,
+        concurrency: int = 10,
+        session: aiohttp.ClientSession | None = None,
+    ) ->

@@ -1,0 +1,12 @@
+test_tool_fragments_and_usage_are_preserved (test_benchmark.StreamTests.test_tool_fragments_and_usage_are_preserved) ... ok
+test_chunks_preserve_token_routes (test_policy.CacheTests.test_chunks_preserve_token_routes) ... ok
+test_invalid_request_does_not_mutate_cache (test_policy.CacheTests.test_invalid_request_does_not_mutate_cache) ... ok
+test_padding_does_not_consume_a_cache_slot (test_policy.CacheTests.test_padding_does_not_consume_a_cache_slot) ... ok
+test_protected_hit_is_not_evicted_before_it_is_visited (test_policy.CacheTests.test_protected_hit_is_not_evicted_before_it_is_visited) ... ok
+test_random_routes_never_alias_live_experts (test_policy.CacheTests.test_random_routes_never_alias_live_experts) ... ok
+test_repeated_routes_hit_and_lru_evicts (test_policy.CacheTests.test_repeated_routes_hit_and_lru_evicts) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.021s
+
+OK

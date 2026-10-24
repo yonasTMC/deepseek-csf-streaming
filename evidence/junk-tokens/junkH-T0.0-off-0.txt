@@ -1,0 +1,594 @@
+=== REASONING
+
+=== CONTENT
+```python
+"""
+lru_ttl_cache.py
+
+A thread-safe LRU cache with per-entry TTL (time-to-live) expiry.
+
+Features
+--------
+- Bounded capacity with least-recently-used eviction.
+- Per-entry TTL; expired entries are lazily evicted on access and
+  proactively swept on insertion when the cache is full.
+- Thread safety via a re-entrant lock.
+- Optional per-entry TTL override on ``put``.
+- Statistics: hits, misses, evictions, expirations.
+- ``get_or_compute`` helper for memoization with a single-flight
+  guarantee (concurrent callers for the same key compute once).
+
+The module is dependency-free and uses only the standard library.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any, Callable, Generic, Hashable, Optional, TypeVar
+
+__all__ = ["LRUTTLCache", "CacheStats"]
+
+K = TypeVar("K", bound=Hashable)
+V = TypeVar("V")
+
+
+@dataclass
+class CacheStats:
+    """Mutable counters describing cache activity."""
+
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    expirations: int = 0
+    insertions: int = 0
+
+    def reset(self) -> None:
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.insertions = 0
+
+    def as_dict(self) -> dict:
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "evictions": self.evictions,
+            "expirations": self.expirations,
+            "insertions": self.insertions,
+        }
+
+
+@dataclass
+class _Entry(Generic[V]):
+    value: V
+    expires_at: Optional[float]  # monotonic deadline, or None for no expiry
+
+
+class LRUTTLCache(Generic[K, V]):
+    """A bounded, thread-safe LRU cache with per-entry TTL expiry.
+
+    Parameters
+    ----------
+    capacity:
+        Maximum number of live entries. Must be >= 1.
+    default_ttl:
+        Default time-to-live in seconds for entries inserted without an
+        explicit TTL. ``None`` means entries never expire by default.
+    clock:
+        Callable returning a monotonically increasing float (seconds).
+        Defaults to :func:`time.monotonic`. Useful for testing.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        default_ttl: Optional[float] = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if capacity < 1:
+            raise ValueError("capacity must be >= 1")
+        if default_ttl is not None and default_ttl <= 0:
+            raise ValueError("default_ttl must be positive or None")
+
+        self._capacity = capacity
+        self._default_ttl = default_ttl
+        self._clock = clock
+
+        # OrderedDict maintains insertion order; we move-to-end on access
+        # so the front is the least-recently-used entry.
+        self._data: "OrderedDict[K, _Entry[V]]" = OrderedDict()
+        self._lock = threading.RLock()
+        self._stats = CacheStats()
+
+        # Single-flight bookkeeping for get_or_compute.
+        self._inflight: dict[K, threading.Event] = {}
+        self._inflight_results: dict[K, Any] = {}
+        self._inflight_errors: dict[K, BaseException] = {}
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    @property
+    def default_ttl(self) -> Optional[float]:
+        return self._default_ttl
+
+    def __len__(self) -> int:
+        with self._lock:
+            self._purge_expired_locked()
+            return len(self._data)
+
+    def __contains__(self, key: K) -> bool:
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return False
+            if self._is_expired_locked(entry):
+                self._remove_locked(key, expired=True)
+                return False
+            return True
+
+    def stats(self) -> CacheStats:
+        """Return a snapshot copy of the statistics."""
+        with self._lock:
+            return CacheStats(**self._stats.as_dict())
+
+    def keys(self) -> list:
+        with self._lock:
+            self._purge_expired_locked()
+            return list(self._data.keys())
+
+    # ------------------------------------------------------------------
+    # Core operations
+    # ------------------------------------------------------------------
+    def get(self, key: K, default: Any = None) -> Any:
+        """Return the value for ``key`` or ``default`` if missing/expired."""
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                self._stats.misses += 1
+                return default
+            if self._is_expired_locked(entry):
+                self._remove_locked(key, expired=True)
+                self._stats.misses += 1
+                return default
+            # Mark as most-recently-used.
+            self._data.move_to_end(key)
+            self._stats.hits += 1
+            return entry.value
+
+    def put(self, key: K, value: V, ttl: Optional[float] = None) -> None:
+        """Insert or update ``key`` with ``value``.
+
+        ``ttl`` overrides the cache default for this entry. Passing
+        ``ttl=None`` uses the cache default; to explicitly disable expiry
+        for a single entry when a default is set, pass ``ttl=float('inf')``.
+        """
+        if ttl is not None and ttl <= 0:
+            raise ValueError("ttl must be positive or None")
+
+        with self._lock:
+            effective_ttl = self._default_ttl if ttl is None else ttl
+            expires_at = (
+                None
+                if effective_ttl is None or effective_ttl == float("inf")
+                else self._clock() + effective_ttl
+            )
+
+            if key in self._data:
+                # Update in place; refresh recency.
+                self._data[key] = _Entry(value=value, expires_at=expires_at)
+                self._data.move_to_end(key)
+            else:
+                self._data[key] = _Entry(value=value, expires_at=expires_at)
+                self._stats.insertions += 1
+
+            # Make room if needed.
+            if len(self._data) > self._capacity:
+                self._purge_expired_locked()
+                while len(self._data) > self._capacity:
+                    self._data.popitem(last=False)
+                    self._stats.evictions += 1
+
+    def delete(self, key: K) -> bool:
+        """Remove ``key``. Returns True if it was present and live."""
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return False
+            if self._is_expired_locked(entry):
+                self._remove_locked(key, expired=True)
+                return False
+            del self._data[key]
+            return True
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+    def purge_expired(self) -> int:
+        """Remove all expired entries. Returns the number removed."""
+        with self._lock:
+            return self._purge_expired_locked()
+
+    # ------------------------------------------------------------------
+    # Memoization helper
+    # ------------------------------------------------------------------
+    def get_or_compute(
+        self,
+        key: K,
+        factory: Callable[[], V],
+        ttl: Optional[float] = None,
+    ) -> V:
+        """Return cached value for ``key`` or compute it via ``factory``.
+
+        Concurrent callers for the same key will block until the first
+        caller finishes computing, then receive the same result (or the
+        same exception). This is the classic "single-flight" pattern.
+        """
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is not None:
+                if self._is_expired_locked(entry):
+                    self._remove_locked(key, expired=True)
+                else:
+                    self._data.move_to_end(key)
+                    self._stats.hits += 1
+                    return entry.value
+
+            # Miss: either we compute, or we wait for another thread.
+            event = self._inflight.get(key)
+            if event is None:
+                event = threading.Event()
+                self._inflight[key] = event
+                is_leader = True
+            else:
+                is_leader = False
+
+        if not is_leader:
+            event.wait()
+            with self._lock:
+                err = self._inflight_errors.pop(key, None)
+                result = self._inflight_results.pop(key, None)
+            if err is not None:
+                raise err
+            return result  # type: ignore[return-value]
+
+        # Leader path: compute outside the lock.
+        try:
+            value = factory()
+        except BaseException as exc:
+            with self._lock:
+                self._stats.misses += 1
+                self._inflight_errors[key] = exc
+                self._inflight.pop(key, None)
+            event.set()
+            raise
+        else:
+            with self._lock:
+                self._stats.misses += 1
+                self._inflight_results[key] = value
+                self._inflight.pop(key, None)
+                # Insert into cache (may evict).
+                self.put(key, value, ttl=ttl)
+            event.set()
+            return value
+
+    # ------------------------------------------------------------------
+    # Internal helpers (callers must hold the lock)
+    # ------------------------------------------------------------------
+    def _is_expired_locked(self, entry: _Entry[V]) -> bool:
+        return entry.expires_at is not None and self._clock() >= entry.expires_at
+
+    def _remove_locked(self, key: K, *, expired: bool) -> None:
+        if key in self._data:
+            del self._data[key]
+            if expired:
+                self._stats.expirations += 1
+
+    def _purge_expired_locked(self) -> int:
+        if not self._data:
+            return 0
+        now = self._clock()
+        expired_keys = [
+            k for k, e in self._data.items()
+            if e.expires_at is not None and now >= e.expires_at
+        ]
+        for k in expired_keys:
+            del self._data[k]
+        self._stats.expirations += len(expired_keys)
+        return len(expired_keys)
+
+    # ------------------------------------------------------------------
+    # Dunder niceties
+    # ------------------------------------------------------------------
+    def __repr__(self) -> str:
+        with self._lock:
+            return (
+                f"{type(self).__name__}(capacity={self._capacity}, "
+                f"size={len(self._data)}, default_ttl={self._default_ttl})"
+            )
+```
+
+```python
+"""
+test_lru_ttl_cache.py
+
+Unit tests for lru_ttl_cache.LRUTTLCache.
+
+Run with:  python -m unittest test_lru_ttl_cache -v
+"""
+
+import threading
+import time
+import unittest
+
+from lru_ttl_cache import LRUTTLCache
+
+
+class FakeClock:
+    """Deterministic monotonic clock for tests."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self._now = start
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        with self._lock:
+            return self._now
+
+    def advance(self, seconds: float) -> None:
+        with self._lock:
+            self._now += seconds
+
+
+class TestBasicOperations(unittest.TestCase):
+    def test_put_get_roundtrip(self):
+        c = LRUTTLCache(capacity=4)
+        c.put("a", 1)
+        self.assertEqual(c.get("a"), 1)
+
+    def test_get_missing_returns_default(self):
+        c = LRUTTLCache(capacity=4)
+        self.assertIsNone(c.get("nope"))
+        self.assertEqual(c.get("nope", "fallback"), "fallback")
+
+    def test_delete(self):
+        c = LRUTTLCache(capacity=4)
+        c.put("a", 1)
+        self.assertTrue(c.delete("a"))
+        self.assertFalse(c.delete("a"))
+        self.assertIsNone(c.get("a"))
+
+    def test_contains(self):
+        c = LRUTTLCache(capacity=4)
+        c.put("a", 1)
+        self.assertIn("a", c)
+        self.assertNotIn("b", c)
+
+    def test_clear(self):
+        c = LRUTTLCache(capacity=4)
+        c.put("a", 1)
+        c.put("b", 2)
+        c.clear()
+        self.assertEqual(len(c), 0)
+
+    def test_invalid_capacity(self):
+        with self.assertRaises(ValueError):
+            LRUTTLCache(capacity=0)
+
+    def test_invalid_default_ttl(self):
+        with self.assertRaises(ValueError):
+            LRUTTLCache(capacity=1, default_ttl=0)
+        with self.assertRaises(ValueError):
+            LRUTTLCache(capacity=1, default_ttl=-1)
+
+    def test_invalid_put_ttl(self):
+        c = LRUTTLCache(capacity=1)
+        with self.assertRaises(ValueError):
+            c.put("a", 1, ttl=0)
+
+
+class TestLRUEviction(unittest.TestCase):
+    def test_evicts_least_recently_used(self):
+        c = LRUTTLCache(capacity=2)
+        c.put("a", 1)
+        c.put("b", 2)
+        # Touch "a" so "b" becomes LRU.
+        self.assertEqual(c.get("a"), 1)
+        c.put("c", 3)
+        self.assertIsNone(c.get("b"))
+        self.assertEqual(c.get("a"), 1)
+        self.assertEqual(c.get("c"), 3)
+
+    def test_update_refreshes_recency(self):
+        c = LRUTTLCache(capacity=2)
+        c.put("a", 1)
+        c.put("b", 2)
+        c.put("a", 10)  # update "a" -> "b" is now LRU
+        c.put("c", 3)
+        self.assertIsNone(c.get("b"))
+        self.assertEqual(c.get("a"), 10)
+
+    def test_eviction_stats(self):
+        c = LRUTTLCache(capacity=1)
+        c.put("a", 1)
+        c.put("b", 2)
+        self.assertEqual(c.stats().evictions, 1)
+
+
+class TestTTL(unittest.TestCase):
+    def test_entry_expires(self):
+        clock = FakeClock()
+        c = LRUTTLCache(capacity=4, default_ttl=10, clock=clock)
+        c.put("a", 1)
+        self.assertEqual(c.get("a"), 1)
+        clock.advance(9.9)
+        self.assertEqual(c.get("a"), 1)
+        clock.advance(0.2)
+        self.assertIsNone(c.get("a"))
+
+    def test_per_entry_ttl_override(self):
+        clock = FakeClock()
+        c = LRUTTLCache(capacity=4, default_ttl=100, clock=clock)
+        c.put("short", 1, ttl=5)
+        c.put("long", 2)
+        clock.advance(6)
+        self.assertIsNone(c.get("short"))
+        self.assertEqual(c.get("long"), 2)
+
+    def test_no_default_ttl_means_no_expiry(self):
+        clock = FakeClock()
+        c = LRUTTLCache(capacity=4, clock=clock)
+        c.put("a", 1)
+        clock.advance(10_000)
+        self.assertEqual(c.get("a"), 1)
+
+    def test_infinite_ttl_disables_expiry(self):
+        clock = FakeClock()
+        c = LRUTTLCache(capacity=4, default_ttl=1, clock=clock)
+        c.put("a", 1, ttl=float("inf"))
+        clock.advance(10_000)
+        self.assertEqual(c.get("a"), 1)
+
+    def test_expiration_stats(self):
+        clock = FakeClock()
+        c = LRUTTLCache(capacity=4, default_ttl=1, clock=clock)
+        c.put("a", 1)
+        clock.advance(2)
+        c.get("a")
+        self.assertEqual(c.stats().expirations, 1)
+
+    def test_purge_expired(self):
+        clock = FakeClock()
+        c = LRUTTLCache(capacity=4, default_ttl=1, clock=clock)
+        c.put("a", 1)
+        c.put("b", 2)
+        clock.advance(2)
+        removed = c.purge_expired()
+        self.assertEqual(removed, 2)
+        self.assertEqual(len(c), 0)
+
+    def test_expired_entries_do_not_count_toward_capacity(self):
+        clock = FakeClock()
+        c = LRUTTLCache(capacity=2, default_ttl=1, clock=clock)
+        c.put("a", 1)
+        c.put("b", 2)
+        clock.advance(2)
+        # Both expired; inserting "c" should not evict anything live.
+        c.put("c", 3)
+        self.assertEqual(c.get("c"), 3)
+        self.assertEqual(c.stats().evictions, 0)
+
+
+class TestStats(unittest.TestCase):
+    def test_hits_and_misses(self):
+        c = LRUTTLCache(capacity=4)
+        c.put("a", 1)
+        c.get("a")
+        c.get("a")
+        c.get("missing")
+        s = c.stats()
+        self.assertEqual(s.hits, 2)
+        self.assertEqual(s.misses, 1)
+
+    def test_reset(self):
+        c = LRUTTLCache(capacity=4)
+        c.put("a", 1)
+        c.get("a")
+        c.stats().reset()
+        self.assertEqual(c.stats().hits, 0)
+
+
+class TestGetOrCompute(unittest.TestCase):
+    def test_computes_on_miss(self):
+        c = LRUTTLCache(capacity=4)
+        calls = []
+        def factory():
+            calls.append(1)
+            return 42
+        self.assertEqual(c.get_or_compute("k", factory), 42)
+        self.assertEqual(c.get_or_compute("k", factory), 42)
+        self.assertEqual(len(calls), 1)
+
+    def test_propagates_exception(self):
+        c = LRUTTLCache(capacity=4)
+        def boom():
+            raise RuntimeError("nope")
+        with self.assertRaises(RuntimeError):
+            c.get_or_compute("k", boom)
+        # A subsequent call should retry (nothing cached).
+        self.assertEqual(c.get_or_compute("k", lambda: 7), 7)
+
+    def test_single_flight_concurrent(self):
+        c = LRUTTLCache(capacity=4)
+        calls = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_factory():
+            calls.append(1)
+            started.set()
+            release.wait(timeout=5)
+            return "value"
+
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                results.append(c.get_or_compute("k", slow_factory))
+            except BaseException as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        started.wait(timeout=5)
+        # Give the other threads a moment to enter the wait path.
+        time.sleep(0.05)
+        release.set()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results, ["value"] * 8)
+        self.assertEqual(len(calls), 1)
+
+
+class TestThreadSafety(unittest.TestCase):
+    def test_concurrent_puts_and_gets(self):
+        c = LRUTTLCache(capacity=64)
+        errors = []
+
+        def worker(offset):
+            try:
+                for i in range(500):
+                    k = (i + offset) % 128
+                    c.put(k, i)
+                    c.get(k)
+                    c.get(k + 1000)
+            except BaseException as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(errors, [])
+        self.assertLessEqual(len(c), 64)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```

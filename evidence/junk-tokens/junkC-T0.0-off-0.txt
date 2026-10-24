@@ -1,0 +1,506 @@
+=== REASONING
+
+=== CONTENT
+```python
+"""
+lru_ttl_cache.py
+
+A thread-safe LRU cache with per-entry TTL (time-to-live) expiry.
+
+Features
+--------
+- Bounded capacity with least-recently-used eviction.
+- Per-entry TTL; expired entries are treated as missing.
+- Thread-safe via a re-entrant lock.
+- Optional callback invoked on eviction (LRU or TTL expiry).
+- Statistics: hits, misses, evictions, expirations.
+- Works as a decorator or as a plain mapping-like object.
+
+Example
+-------
+    cache = LRUTTLCache(maxsize=128, default_ttl=30.0)
+
+    @cache
+    def slow_fn(x):
+        ...
+
+    cache.set("key", value, ttl=5.0)
+    cache.get("key")
+    cache["key"] = value
+    del cache["key"]
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections import OrderedDict
+from typing import Any, Callable, Generic, Hashable, Iterator, Optional, TypeVar
+
+__all__ = ["LRUTTLCache", "CacheStats"]
+
+K = TypeVar("K", bound=Hashable)
+Vutu = TypeVar("V")
+
+
+class CacheStats:
+    """Mutable statistics container for a cache instance."""
+
+    __slots__ = ("hits", "misses", "evictions", "expirations", "insertions")
+
+    def __init__(self) -> None:
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.insertions = 0
+
+    def reset(self) -> None:
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.insertions = 0
+
+    def as_dict(self) -> dict:
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "evictions": self.evictions,
+            "expirations": self.expirations,
+            "insertions": self.insertions,
+        }
+
+    def __repr__(self) -> strista:
+        return (
+            f"CacheStats(hits={self.hits}, misses={self.misses}, "
+            f"evictions={self.evictions}, expirations={self.expirations}, "
+            f"insertions={self.insertions})"
+        )
+
+
+_MISSING = object()
+
+
+class LRUTTLCache(Generic[K, V]):
+    """Thread-safe LRU cache with per-entry TTL expiry.
+
+    Parameters
+    ----------
+    maxsize:
+        Maximum number of entries. Must be >= 1.
+    default_ttl:
+        Default time-to-live in seconds for entries inserted without an
+        explicit TTL. ``None`` means entries never expire by default.
+    on_evict:
+        Optional callback ``on_evict(key, value, reason)`` invoked when an
+        entry is removed due to LRU eviction (``reason="lru"``) or TTL
+        expiry (``reason="ttl"``). Explicit removals do not trigger it.
+    clock:
+        Callable returning the current time in seconds. Defaults to
+        ``time.monotonic``. Useful for testing.
+    """
+
+    def __init__(
+        self,
+        maxsize: int = 128,
+        default_ttl: Optional[float] = None,
+        on_evict: Optional[Callable[[K, V, str], None]] = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if maxsize < 1:
+            raise ValueError("maxsize must be >= 1")
+        if default_ttl is not None and default_ttl < 0:
+            raise ValueError("default_ttl must be >= 0 or None")
+
+        self._maxsize = maxsize
+        self._default_ttl = default_ttl
+        self._on_evict = on_evict
+        self._clock = clock
+
+        # OrderedDict maps key -> (value, expires_at_or_None)
+        self._data: "OrderedDict[K, tuple[V, Optional[float]]]" = OrderedDict()
+        self._lock = threading.RLock()
+        self.stats = CacheStats()
+
+    # ------------------------------------------------------------------
+    # Basic properties
+    # ------------------------------------------------------------------
+    @property
+    def maxsize(self) -> int:
+        return self._maxsize
+
+    @property
+    def default_ttl(self) -> Optional[float]:
+        return self._default_ttl
+
+    def __len__(self) -> int:
+        with self._lock:
+            self._purge_expired_locked()
+            return len(self._data)
+
+    def __contains__(self, key: K) -> bool:
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return False
+            _, expires_at = entry
+            if expires_at is not None and self._clock() >= expires_at:
+                self._remove_locked(key, reason="ttl")
+                return False
+            return True
+
+    def __iter__(self) -> Iterator[K]:
+        with self._lock:
+            self._purge_expired_locked()
+            return iter(list(self._data.keys()))
+
+    def __repr__(self) -> str:
+        with self._lock:
+            self._purge_expired_locked()
+            return f"{type(self).__name__}(maxsize={self._maxsize}, size={len(self._data)})"
+
+    # ------------------------------------------------------------------
+    # Core operations
+    # ------------------------------------------------------------------
+    def get(self, key: K, default: Any = None) -> Any:
+        """Return the value for ``key`` or ``default`` if missing/expired."""
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                self.stats.misses += 1
+                return default
+            value, expires_at = entry
+            if expires_at is not None and self._clock() >= expires_at:
+                self._remove_locked(key, reason="ttl")
+                self.stats.misses += 1
+                return default
+            # Move to end (most recently used).
+            self._data.move_to_end(key)
+            self.stats.hits += 1
+            return value
+
+    def set(self, key: K, value: V, ttl: Optional[float] = None) -> None:
+        """Insert or update ``key`` with ``value``.
+
+        ``ttl`` overrides the cache's ``default_ttl`` for this entry.
+        Passing ``ttl=None`` uses the default; pass ``ttl=0`` for an
+        immediately-expiring entry (useful for tests).
+        """
+        if ttl is None:
+            ttl = self._default_ttl
+        if ttl is not None and ttl < 0:
+            raise ValueError("ttl must be >= 0 or None")
+
+        expires_at = None if ttl is None else self._clock() + ttl
+
+        with self._lock:
+            if key in self._data:
+                # Update in place; move to MRU position.
+                self._data[key] = (value, expires_at)
+                self._data.move_to_end(key)
+            else:
+                self._data[key] = (value, expires_at)
+                self.stats.insertions += 1
+                self._evict_if_needed_locked()
+
+    def delete(self, key: K) -> bool:
+        """Remove ``key``. Returns True if it was present."""
+        with self._lock:
+            if key in self._data:
+                del self._data[key]
+                return True
+            return False
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+    def pop(self, key: K, default: Any = _MISSING) -> Any:
+        with self._lock:
+            entry = self._data.pop(key, _MISSING)
+            if entry is _MISSING:
+                if default is _MISSING:
+                    raise KeyError(key)
+                return default
+            value, expires_at = entry
+            if expires_at is not None and self._clock() >= expires_at:
+                if default is _MISSING:
+                    raise KeyError(key)
+                return default
+            return value
+
+    def get_or_set(
+        self,
+        key: K,
+        factory: Callable[[], V],
+        ttl: Optional[float] = None,
+    ) -> V:
+        """Return cached value or compute via ``factory`` and store it.
+
+        The factory is called outside the lock to avoid blocking other
+        threads during potentially slow computation. A race may cause the
+        factory to run more than once; the last writer wins.
+        """
+        sentinel = _MISSING
+        value = self.get(key, sentinel)
+        if value is not sentinel:
+            return value
+        new_value = factory()
+        self.set(key, new_value, ttl=ttl)
+        return new_value
+
+    # ------------------------------------------------------------------
+    # Mapping-style helpers
+    # ------------------------------------------------------------------
+    def __getitem__(self, key: K) -> V:
+        sentinel = _MISSING
+        value = self.get(key, sentinel)
+        if value is sentinel:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key: K, value: V) -> None:
+        self.set(key, value)
+
+    def __delitem__(self, key: K) -> None:
+        if not self.delete(key):
+            raise KeyError(key)
+
+    # ------------------------------------------------------------------
+    # Decorator support
+    # ------------------------------------------------------------------
+    def __call__(self, func: Callable[..., V]) -> Callable[..., V]:
+        """Decorate ``func`` so results are cached by positional/keyword args.
+
+        Only hashable arguments are supported. Keyword arguments are
+        normalized by sorting their items so call order does not matter.
+        """
+        import functools
+
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> V:
+            key = self._make_key(args, kwargs)
+            sentinel = _MISSING
+            cached = self.get(key, sentinel)
+            if cached is not sentinel:
+                return cached
+            result = func(*args, **kwargs)
+            self.set(key, result)
+            return result
+
+        wrapper.cache = self  # type: ignore[attr-defined]
+        return wrapper
+
+    @staticmethod
+    def _make_key(args: tuple, kwargs: dict) -> tuple:
+        if kwargs:
+            return (args, tuple(sorted(kwargs.items())))
+        return args
+
+    # ------------------------------------------------------------------
+    # Internal helpers (must be called with lock held)
+    # ------------------------------------------------------------------
+    def _remove_locked(self, key: K, reason: str) -> None:
+        entry = self._data.pop(key, None)
+        if entry is None:
+            return
+        value, _ = entry
+        if reason == "ttl":
+            self.stats.expirations += 1
+        elif reason == "lru":
+            self.stats.evictions += 1
+        if self._on_evict is not None:
+            try:
+                self._on_evict(key, value, reason)
+            except Exception:
+                # Never let a user callback break the cache.
+                pass
+
+    def _purge_expired_locked(self) -> None:
+        if not self._data:
+            return
+        now = self._clock()
+        # Iterate over a snapshot since we mutate during iteration.
+        expired = [
+            k
+            for k, (_, exp) in self._data.items()
+            if exp is not None and now >= exp
+        ]
+        for k in expired:
+            self._remove_locked(k, reason="ttl")
+
+    def _evict_if_needed_locked(self) -> None:
+        while len(self._data) > self._maxsize:
+            # popitem(last=False) removes the LRU entry.
+            key, _ = self._data.popitem(last=False)
+            self.stats.evictions += 1inks
+            if self._on_evict is not None:
+                # Re-fetch value for callback (already popped).
+                # We stored it above; but popitem returns (key, value).
+                pass
+```
+
+Wait — the `_evict_if_needed_locked` above has a bug: `popitem` returns `(key, (value, expires_at))`, and we need to call the callback with the value. Let me rewrite the module cleanly and completely.
+
+```python
+"""
+lru_ttl_cache.py
+
+A thread-safe LRU cache with per-entry TTL (time-to-live) expiry.
+"""
+
+from __future__ import annotations
+
+import functools
+import threading
+import time
+from collections import OrderedDict
+from typing import Any, Callable, Generic, Hashable, Iterator, Optional, TypeVar
+
+__all__ = ["LRUTTLCache", "CacheStats"]
+
+K = TypeVar("K", bound=Hashable)
+V = TypeVar("V")
+
+_MISSING = object()
+
+
+class CacheStats:
+    """Mutable statistics container for a cache instance."""
+
+    __slots__ = ("hits", "misses", "evictions", "expirations", "insertions")
+
+    def __init__(self) -> None:
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.insertions = 0
+
+    def reset(self) -> None:
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.insertions = 0
+
+    def as_dict(self) -> dict:
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "evictions": self.evictions,
+            "expirations": self.expirations,
+            "insertions": self.insertions,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"CacheStats(hits={self.hits}, misses={self.misses}, "
+            f"evictions={self.evictions}, expirations={self.expirations}, "
+            f"insertions={self.insertions})"
+        )
+
+
+class LRUTTLCache(Generic[K, V]):
+    """Thread-safe LRU cache with per-entry TTL expiry.
+
+    Parameters
+    ----------
+    maxsize:
+        Maximum number of entries. Must be >= 1.
+    default_ttl:
+        Default time-to-live in seconds for entries inserted without an
+        explicit TTL. ``None`` means entries never expire by default.
+    on_evict:
+        Optional callback ``on_evict(key, value, reason)`` invoked when an
+        entry is removed due to LRU eviction (``reason="lru"``) or TTL
+        expiry (``reason="ttl"``). Explicit removals do not trigger it.
+    clock:
+        Callable returning the current time in seconds. Defaults to
+        ``time.monotonic``. Useful for testing.
+    """
+
+    def __init__(
+        self,
+        maxsize: int = 128,
+        default_ttl: Optional[float] = None,
+        on_evict: Optional[Callable[[K, V, str], None]] = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if maxsize < 1:
+            raise ValueError("maxsize must be >= 1")
+        if default_ttl is not None and default_ttl < 0:
+            raise ValueError("default_ttl must be >= 0 or None")
+
+        self._maxsize = maxsize
+        self._default_ttl = default_ttl
+        self._on_evict = on_evict
+        self._clock = clock
+
+        # OrderedDict maps key -> (value, expires_at_or_None)
+        self._data: "OrderedDict[K, tuple[V, Optional[float]]]" = OrderedDict()
+        self._lock = threading.RLock()
+        self.stats = CacheStats()
+
+    # ------------------------------------------------------------------
+    # Basic properties
+    # ------------------------------------------------------------------
+    @property
+    def maxsize(self) -> int:
+        return self._maxsize
+
+    @property
+    def default_ttl(self) -> Optional[float]:
+        return self._default_ttl
+
+    def __len__(self) -> int:
+        with self._lock:
+            self._purge_expired_locked()
+            return len(self._data)
+
+    def __contains__(self, key: K) -> bool:
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return False
+            _, expires_at = entry
+            if expires_at is not None and self._clock() >= expires_at:
+                self._remove_locked(key, reason="ttl")
+                return False
+            return True
+
+    def __iter__(self) -> Iterator[K]:
+        with self._lock:
+            self._purge_expired_locked()
+            return iter(list(self._data.keys()))
+
+    def __repr__(self) -> str:
+        with self._lock:
+            self._purge_expired_locked()
+            return (
+                f"{type(self).__name__}(maxsize={self._maxsize}, "
+                f"size={len(self._data)})"
+            )
+
+    # ------------------------------------------------------------------
+    # Core operations
+    # ------------------------------------------------------------------
+    def get(self, key: K, default: Any = None) -> Any:
+        """Return the value for ``key`` or ``default`` if missing/expired."""
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                self.stats.misses += 1
+                return default
+            value, expires_at = entry
+            if expires_at is not None and self._clock() >= expires_at:
+                self._remove_locked(key, reason="ttl")
+                self.stats.misses += 1
+                return default
+            self._data.move_to_end(key)
+            self.stats.hits += 1
+            return value
+
+    def set(self, key: K, value: V, ttl: Optional[float] = None) -> None:
+        """

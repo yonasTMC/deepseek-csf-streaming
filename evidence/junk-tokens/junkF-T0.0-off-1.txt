@@ -1,0 +1,364 @@
+=== REASONING
+
+=== CONTENT
+Here's a complete Python script that parses JSON lines logs, aggregates per-endpoint latency percentiles, and prints a table:
+
+```python
+#!/usr/bin/env python3
+"""
+log_analyzer.py - Parse JSONL logs, aggregate per-endpoint latency percentiles.
+
+Usage:
+    python log_analyzer.py logs.jsonl
+    python log_analyzer.py logs.jsonl --percentiles 50 90 99 --sort p99
+"""
+
+import argparse
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Aggregate per-endpoint latency percentiles from JSONL logs."
+    )
+    parser.add_argument("logfile", type=Path, help="Path to JSONL log file")
+    parser.add_argument(
+        "--percentiles",
+        type=float,
+        nargs="+",
+        default=[50, 90, 95, 99],
+        help="Percentiles to compute (default: 50 90 95 99)",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=["endpoint", "count", "mean", "p50", "p90", "p95", "p99"],
+        default="endpoint",
+        help="Sort output by column (default: endpoint)",
+    )
+    parser.add_argument(
+        "--endpoint-field",
+        default="endpoint",
+        help="JSON field name for endpoint (default: endpoint)",
+    )
+    parser.add_argument(
+        "--latency-field",
+        default="latency_ms",
+        help="JSON field name for latency in ms (default: latency_ms)",
+    )
+    return parser.parse_args(argv)
+
+
+def percentile(sorted_values: List[float], p: float) -> float:
+    """Linear-interpolation percentile (same as numpy's default)."""
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    k = (len(sorted_values) - 1) * (p / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = k - lo
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * frac
+
+
+def aggregate(
+    logfile: Path,
+    endpoint_field: str,
+    latency_field: str,
+    percentiles: List[float],
+) -> Dict[str, Dict[str, float]]:
+    """Read JSONL file and aggregate latencies per endpoint."""
+    buckets: Dict[str, List[float]] = defaultdict(list)
+    skipped = 0
+
+    with logfile.open("r", encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                endpoint = record[endpoint_field]
+                latency = float(record[latency_field])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                skipped += 1
+                continue
+            buckets[endpoint].append(latency)
+
+    if skipped:
+        print(f"[warn] skipped {skipped} malformed line(s)", file=sys.stderr)
+
+    results: Dict[str, Dict[str, float]] = {}
+    for endpoint, values in buckets.items():
+        values.sort()
+        stats = {
+            "count": len(values),
+            "mean": sum(values) / len(values),
+            "min": values[0],
+            "max": values[-1],
+        }
+        for p in percentiles:
+            stats[f"p{p:g}"] = percentile(values, p)
+        results[endpoint] = stats
+    return results
+
+
+def format_table(
+    results: Dict[str, Dict[str, float]], percentiles: List[float]
+) -> str:
+    """Render results as a fixed-width ASCII table."""
+    p_cols = [f"p{p:g}" for p in percentiles]
+    headers = ["endpoint", "count", "mean", "min", "max"] + p_cols
+
+    rows = []
+    for endpoint, stats in results.items():
+        row = [
+            endpoint,
+            str(int(stats["count"])),
+            f"{stats['mean']:.2f}",
+            f"{stats['min']:.2f}",
+            f"{stats['max']:.2f}",
+        ] + [f"{stats[c]:.2f}" for c in p_cols]
+        rows.append(row)
+
+    widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h)
+              for i, h in enumerate(headers)]
+
+    def fmt_row(cells: List[str]) -> str:
+        return "  ".join(c.ljust(w) for c, w in zip(cells, widths))
+
+    sep = "  ".join("-" * w for w in widths)
+    lines = [fmt_row(headers), sep] + [fmt_row(r) for r in rows]
+    return "\n".join(lines)
+
+
+def sort_results(
+    results: Dict[str, Dict[str, float]], key: str
+) -> Dict[str, Dict[str, float]]:
+    if key == "endpoint":
+        return dict(sorted(results.items(), key=lambda kv: kv[0]))
+    return dict(sorted(results.items(), key=lambda kv: kv[1][key], reverse=True))
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    if not args.logfile.is_file():
+        print(f"error: file not found: {args.logfile}", file=sys.stderr)
+        return 1
+
+    results = aggregate(
+        args.logfile,
+        args.endpoint_field,
+        args.latency_field,
+        args.percentiles,
+    )
+    if not results:
+        print("No valid records found.", file=sys.stderr)
+        return 1
+
+    results = sort_results(results, args.sort)
+    print(format_table(results, args.percentiles))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+And here's the test suite:
+
+```python
+"""
+test_log_analyzer.py - Unit tests for log_analyzer.py
+
+Run with:  python -m pytest test_log_analyzer.py -v
+"""
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent))
+from log_analyzer import (  # noqa: E402
+    aggregate,
+    format_table,
+    main,
+    parse_args,
+    percentile,
+    sort_results,
+)
+
+
+# ---------- percentile ----------
+
+def test_percentile_empty():
+    assert percentile([], 50) == 0.0
+
+
+def test_percentile_single():
+    assert percentile([42.0], 99) == 42.0
+
+
+def test_percentile_median_odd():
+    assert percentile([1, 2, 3, 4, 5], 50) == 3.0
+
+
+def test_percentile_median_even():
+    assert percentile([1, 2, 3, 4], 50) == 2.5
+
+
+def test_percentile_extremes():
+    vals = [10, 20, 30, 40, 50]
+    assert percentile(vals, 0) == 10
+    assert percentile(vals, 100) == 50
+
+
+def test_percentile_p90():
+    vals = list(range(1, 101))  # 1..100
+    # k = 99 * 0.9 = 89.1 -> 90 + 0.1*(91-90) = 90.1
+    assert percentile(vals, 90) == pytest.approx(90.1)
+
+
+# ---------- aggregate ----------
+
+def _write_jsonl(path: Path, records):
+    with path.open("w", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r) + "\n")
+
+
+def test_aggregate_basic(tmp_path):
+    log = tmp_path / "logs.jsonl"
+    _write_jsonl(log, [
+        {"endpoint": "/a", "latency_ms": 10},
+        {"endpoint": "/a", "latency_ms": 20},
+        {"endpoint": "/a", "latency_ms": 30},
+        {"endpoint": "/b", "latency_ms": 100},
+    ])
+    res = aggregate(log, "endpoint", "latency_ms", [50, 99])
+    assert set(res) == {"/a", "/b"}
+    assert res["/a"]["count"] == 3
+    assert res["/a"]["mean"] == pytest.approx(20.0)
+    assert res["/a"]["min"] == 10
+    assert res["/a"]["max"] == 30
+    assert res["/a"]["p50"] == pytest.approx(20.0)
+    assert res["/b"]["count"] == 1
+    assert res["/b"]["p99"] == 100
+
+
+def test_aggregate_skips_malformed(tmp_path, capsys):
+    log = tmp_path / "logs.jsonl"
+    log.write_text(
+        '{"endpoint": "/a", "latency_ms": 5}\n'
+        'not json\n'
+        '{"endpoint": "/a"}\n'          # missing latency
+        '{"latency_ms": 7}\n'           # missing endpoint
+        '{"endpoint": "/a", "latency_ms": "bad"}\n'
+        '{"endpoint": "/a", "latency_ms": 15}\n',
+        encoding="utf-8",
+    )
+    res = aggregate(log, "endpoint", "latency_ms", [50])
+    assert res["/a"]["count"] == 2
+    err = capsys.readouterr().err
+    assert "skipped 4" in err
+
+
+def test_aggregate_custom_fields(tmp_path):
+    log = tmp_path / "logs.jsonl"
+    _write_jsonl(log, [
+        {"route": "/x", "duration": 5},
+        {"route": "/x", "duration": 15},
+    ])
+    res = aggregate(log, "route", "duration", [50])
+    assert res["/x"]["count"] == 2
+    assert res["/x"]["p50"] == pytest.approx(10.0)
+
+
+# ---------- sort_results ----------
+
+def test_sort_by_endpoint():
+    res = {"/b": {"count": 1, "mean": 1}, "/a": {"count": 2, "mean": 2}}
+    out = sort_results(res, "endpoint")
+    assert list(out) == ["/a", "/b"]
+
+
+def test_sort_by_count_desc():
+    res = {"/a": {"count": 1, "mean": 1}, "/b": {"count": 5, "mean": 2}}
+    out = sort_results(res, "count")
+    assert list(out) == ["/b", "/a"]
+
+
+# ---------- format_table ----------
+
+def test_format_table_contains_headers():
+    res = {"/a": {"count": 2, "mean": 15.0, "min": 10, "max": 20,
+                  "p50": 15.0, "p99": 20.0}}
+    table = format_table(res, [50, 99])
+    assert "endpoint" in table
+    assert "p50" in table
+    assert "p99" in table
+    assert "/a" in table
+
+
+# ---------- parse_args ----------
+
+def test_parse_args_defaults():
+    args = parse_args(["logs.jsonl"])
+    assert args.logfile == Path("logs.jsonl")
+    assert args.percentiles == [50, 90, 95, 99]
+    assert args.sort == "endpoint"
+
+
+def test_parse_args_custom():
+    args = parse_args([
+        "logs.jsonl", "--percentiles", "50", "99", "--sort", "p99",
+    ])
+    assert args.percentiles == [50, 99]
+    assert args.sort == "p99"
+
+
+# ---------- main ----------
+
+def test_main_missing_file(tmp_path, capsys):
+    rc = main([str(tmp_path / "nope.jsonl")])
+    assert rc == 1
+    assert "file not found" in capsys.readouterr().err
+
+
+def test_main_empty_file(tmp_path, capsys):
+    log = tmp_path / "empty.jsonl"
+    log.write_text("", encoding="utf-8")
+    rc = main([str(log)])
+    assert rc == 1
+    assert "No valid records" in capsys.readouterr().err
+
+
+def test_main_success(tmp_path, capsys):
+    log = tmp_path / "logs.jsonl"
+    _write_jsonl(log, [
+        {"endpoint": "/a", "latency_ms": 10},
+        {"endpoint": "/a", "latency_ms": 20},
+        {"endpoint": "/b", "latency_ms": 5},
+    ])
+    rc = main([str(log), "--percentiles", "50"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "/a" in out
+    assert "/b" in out
+    assert "p50" in out
+```
+
+**Key design points:**
+
+- **`percentile()`** uses linear interpolation (matching NumPy's default), so `p50` of `[1,2,3,4]` is `2.5`.
+- **`aggregate()`** is tolerant of malformed lines — it counts and warns rather than crashing, which is important for real-world logs.
+- **Field names are configurable** via `--endpoint-field` / `--latency-field` so the tool works with different log schemas.
+- **`sort_results()`** supports sorting by any computed column, with descending order for numeric columns (most useful for spotting slow endpoints).
+- **`main()`** returns an exit code rather than calling `sys.exit()` directly, making it testable.
+- **Tests** cover edge cases (empty input, single value, even/odd counts), malformed lines, custom fields, sorting, formatting, and CLI behavior.

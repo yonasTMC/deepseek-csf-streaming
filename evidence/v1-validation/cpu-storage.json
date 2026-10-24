@@ -1,0 +1,72 @@
+{
+  "ok": true,
+  "cuda_initialized": true,
+  "checks": [
+    {
+      "layer": 0,
+      "rank": 0,
+      "experts": [
+        0,
+        177,
+        383
+      ],
+      "staged_bytes": 26785140,
+      "seconds": 0.28050949797034264
+    },
+    {
+      "layer": 0,
+      "rank": 1,
+      "experts": [
+        0,
+        177,
+        383
+      ],
+      "staged_bytes": 26784816,
+      "seconds": 0.011024391977116466
+    },
+    {
+      "layer": 20,
+      "rank": 0,
+      "experts": [
+        0,
+        177,
+        383
+      ],
+      "staged_bytes": 26785280,
+      "seconds": 0.015570960938930511
+    },
+    {
+      "layer": 20,
+      "rank": 1,
+      "experts": [
+        0,
+        177,
+        383
+      ],
+      "staged_bytes": 26785268,
+      "seconds": 0.009926429018378258
+    },
+    {
+      "layer": 39,
+      "rank": 0,
+      "experts": [
+        0,
+        177,
+        383
+      ],
+      "staged_bytes": 26786104,
+      "seconds": 0.014362359885126352
+    },
+    {
+      "layer": 39,
+      "rank": 1,
+      "experts": [
+        0,
+        177,
+        383
+      ],
+      "staged_bytes": 26785976,
+      "seconds": 0.00939239002764225
+    }
+  ]
+}

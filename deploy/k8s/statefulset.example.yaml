@@ -1,0 +1,271 @@
+# Example deployment: DeepSeek-V4.1-Flash-1017 (abliterated, lossless CSF) on one node with
+# 2x RTX PRO 6000 (96 GB), 124 GiB RAM and two NVMe drives, using the CSF expert-streaming engine.
+# Replace the <placeholders> and host paths under /data and /models with your own.
+#
+# Host layout this expects:
+#   /models/...lossless-CSF            Hugging Face cache directory of the checkpoint (read-only)
+#   /data/nvme1/expert-pack/split      split expert pack, TP rank 0 (first NVMe drive)
+#   /data/nvme2/expert-pack/split      split expert pack, TP rank 1 (second NVMe drive)
+#   /data/nvme2/engram/...             optional byte-identical copy of Engram shard 48 on the second drive
+#   /data/csf/placement                placement JSON (evidence/placement-learned-20261024.json)
+#   /data/csf/runtime                  caches, metrics and route traces (written)
+#
+# The node needs nothing else heavy running: the pod pins about 77 GiB of host RAM.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vllm-deepseek-v41-flash-abliterated
+  namespace: llm
+spec:
+  serviceName: vllm-deepseek-v41-flash-abliterated-headless
+  replicas: 0
+  selector:
+    matchLabels:
+      app: llm-engine
+      model: deepseek-v41-flash-abliterated
+  template:
+    metadata:
+      labels:
+        app: llm-engine
+        model: deepseek-v41-flash-abliterated
+    spec:
+      runtimeClassName: nvidia
+      imagePullSecrets:
+      - name: registry-pull  # if your registry needs credentials
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        has-gpu: 'true'
+        kubernetes.io/hostname: <gpu-node>
+      tolerations:
+      - key: nvidia.com/gpu  # optional: keep other workloads off the GPU node with this taint
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi
+      - name: model-volume
+        hostPath:
+          path: /models/DeepSeek-V4.1-Flash-1017-abliterated-lossless-CSF
+          type: Directory
+      - name: engram-48
+        hostPath:
+          path: /data/nvme2/engram/model-00048-of-00048.safetensors
+          type: File
+      - name: pack-nvme1
+        hostPath:
+          path: /data/nvme1/expert-pack
+          type: Directory
+      - name: pack-nvme2
+        hostPath:
+          path: /data/nvme2/expert-pack
+          type: Directory
+      - name: placement
+        hostPath:
+          path: /data/csf/placement
+          type: Directory
+      - name: runtime
+        hostPath:
+          path: /data/csf/runtime
+          type: DirectoryOrCreate
+      containers:
+      - name: vllm
+        # Built from this repo's Dockerfile (FROM ghcr.io/local-inference-lab/vllm@sha256:fd74019f...).
+        image: <registry>/deepseek-csf-stream:<tag>
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: false
+          seccompProfile:
+            type: Unconfined  # Engram disk tables use io_uring
+          capabilities:
+            add:
+            - IPC_LOCK
+            - SYS_RESOURCE
+        env:
+        - name: MODEL
+          value: /models/DeepSeek-V4.1-Flash-1017-abliterated-lossless-CSF/snapshots/<revision>
+        - name: CHECKPOINT
+          value: csf  # selects the mxfp4_csf loader; without it scales are misread silently
+        - name: TP
+          value: '2'
+        - name: PORT
+          value: '8000'
+        - name: OMP_NUM_THREADS
+          value: '1'
+        - name: HF_HUB_OFFLINE
+          value: '1'
+        - name: TRANSFORMERS_OFFLINE
+          value: '1'
+        - name: XDG_CACHE_HOME
+          value: /runtime/cache
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: void
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: compute,utility
+        - name: ENGRAM_TABLE_MEMORY
+          value: disk  # the tables are ~189 GiB; only their scales are RAM-resident
+        - name: ENGRAM_DISK_RESIDENT_SCALES
+          value: 'true'
+        - name: VLLM_ENABLE_PCIE_ALLREDUCE
+          value: '1'
+        - name: VLLM_DISABLE_SHARED_EXPERTS_STREAM
+          value: '1'
+        - name: B12X_W4A8_CSF_INLINE
+          value: '0'
+        - name: B12X_AUTOTUNE
+          value: '0'
+        # Expert streaming engine (csf_streaming, installed via sitecustomize).
+        - name: CSF_STREAMING
+          value: '1'
+        - name: CSF_V4
+          value: '1'
+        - name: CSF_GRAPH
+          value: '1'
+        # Up to 4 sequences x (1 + 3 DSpark drafts) = 16-token decode steps inside CUDA graphs.
+        # Steps routing more unpinned experts than the LRU holds borrow pinned slots (soft pinning).
+        - name: CSF_GRAPH_TOKENS
+          value: '16'
+        - name: CSF_STREAM_SLOTS
+          value: '208'  # 216 does not leave room for 4,096-token prefill activations
+        - name: CSF_PACK_DIRS
+          value: /pack/nvme1/split:/pack/nvme2/split  # built by scripts/pack_experts.py --split 2
+        - name: CSF_PLACEMENT
+          value: /placement/placement-learned-20261024.json  # evidence/; relearn from your traces with scripts/learn_placement.py
+        - name: CSF_RAM_EXPERTS
+          value: '4400'  # ~77 GiB of pinned host RAM across both ranks
+        - name: CSF_HOST_CACHE
+          value: '160'  # read-ahead buffers (9.4 MB each); prefill reads the next expert group ahead
+        - name: CSF_PREFETCH_INFLIGHT
+          value: '24'
+        # Prefill loads each distinct expert at most once per layer per chunk (expert-major).
+        - name: CSF_EXPERT_MAJOR_PREFILL
+          value: '1'
+        - name: CSF_PREFETCH_WIDTH
+          value: '0'  # decode next-layer prefetch measured slower (82-83 tok/s off vs 73-77 at width 6)
+        - name: CSF_PREFILL_PREFETCH
+          value: '0'  # measured slower at every vote threshold
+        - name: CSF_STREAM_METRICS_DIR
+          value: /runtime/metrics
+        - name: CSF_STREAM_METRICS_INTERVAL
+          value: '2000'
+        command:
+        - /bin/bash
+        - -lc
+        args:
+        - |
+          set -euo pipefail
+          ulimit -l unlimited
+          ulimit -n 1048576
+          test -r "${MODEL}/config.json"
+          test -r "${CSF_PLACEMENT}"
+          mkdir -p /runtime/traffic /runtime/metrics /runtime/cache
+          # Routing ids only (no text), rank 0, one file per start; used to relearn placement.
+          export CSF_V4_TRACE="/runtime/traffic/routes-$(date +%Y%m%d-%H%M%S).bin"
+          exec /usr/local/bin/lil-serve \
+            --profile ds41-flash \
+            --hardware rtx-pro-6000-pcie \
+            -- \
+            --mode dspark --draft-tokens 3 \
+            --max-model-len 1048576 \
+            --max-num-seqs 4 \
+            --max-num-batched-tokens 4096 \
+            --max-cudagraph-capture-size 16 \
+            --gpu-memory-utilization 0.97 \
+            --kv-cache-memory-bytes 2147483648 \
+            --host 0.0.0.0 \
+            --port "${PORT}" \
+            --served-model-name DeepSeek-V4.1-Flash-Abliterated
+        ports:
+        - name: http-vllm
+          containerPort: 8000
+          protocol: TCP
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http-vllm
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 180
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http-vllm
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http-vllm
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 4
+        resources:
+          claims:
+          - name: gpus
+          requests:
+            memory: 100Gi
+          limits:
+            memory: 116Gi
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: model-volume
+          mountPath: /models/DeepSeek-V4.1-Flash-1017-abliterated-lossless-CSF
+          readOnly: true
+        # Engram shard 48 served from nvme2 so both Engram tables do not share one drive.
+        - name: engram-48
+          mountPath: /models/DeepSeek-V4.1-Flash-1017-abliterated-lossless-CSF/blobs/<shard-48-blob>
+          readOnly: true
+        - name: pack-nvme1
+          mountPath: /pack/nvme1
+          readOnly: true
+        - name: pack-nvme2
+          mountPath: /pack/nvme2
+          readOnly: true
+        - name: placement
+          mountPath: /placement
+          readOnly: true
+        - name: runtime
+          mountPath: /runtime
+      resourceClaims:
+      - name: gpus
+        resourceClaimName: <two-gpu-claim>  # DRA claim for both GPUs; or use nvidia.com/gpu: 2 limits
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-deepseek-v41-flash-abliterated-headless
+  namespace: llm
+spec:
+  clusterIP: None
+  selector:
+    app: llm-engine
+    model: deepseek-v41-flash-abliterated
+  ports:
+  - name: http-vllm
+    protocol: TCP
+    port: 8000
+    targetPort: http-vllm
+    appProtocol: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseek-v41-flash-abliterated
+  namespace: llm
+spec:
+  type: ClusterIP
+  selector:
+    app: llm-engine
+    model: deepseek-v41-flash-abliterated
+  ports:
+  - name: http-vllm
+    protocol: TCP
+    port: 8000
+    targetPort: http-vllm
+    appProtocol: http

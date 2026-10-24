@@ -1,0 +1,747 @@
+=== REASONING
+
+=== CONTENT
+I'll create a comprehensive asyncio HTTP health checker with retries, exponential backoff, and a summary report, plus tests.
+
+## Main Implementation
+
+```python
+# health_checker.py
+"""
+Asyncio HTTP Health Checker with retries, exponential backoff, and summary reporting.
+"""
+
+import asyncio
+import time
+import random
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any
+from enum import Enum
+
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
+
+
+class HealthStatus(Enum):
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+    DEGRADED = "degraded"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class EndpointConfig:
+    """Configuration for a single endpoint to check."""
+    url: str
+    name: Optional[str] = None
+    method: str = "GET"
+    expected_status: int = 200
+    timeout: float = 5.0
+    max_retries: int = 3
+    base_backoff: float = 0.5
+    max_backoff: float = 10.0
+    jitter: bool = True
+    headers: Dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.name is None:
+            self.name = self.url
+
+
+@dataclass
+class CheckResult:
+    """Result of a single endpoint health check."""
+    name: str
+    url: str
+    status: HealthStatus
+    attempts: int
+    total_time: float
+    status_code: Optional[int] = None
+    error: Optional[str] = None
+    attempt_times: List[float] = field(default_factory=list)
+
+
+@dataclass
+class HealthReport:
+    """Aggregated health report for all endpoints."""
+    results: List[CheckResult]
+    start_time: float
+    end_time: float
+
+    @property
+    def duration(self) -> float:
+        return self.end_time - self.start_time
+
+    @property
+    def overall_status(self) -> HealthStatus:
+        if not self.results:
+            return HealthStatus.UNKNOWN
+        statuses = {r.status for r in self.results}
+        if statuses == {HealthStatus.HEALTHY}:
+            return HealthStatus.HEALTHY
+        if HealthStatus.HEALTHY in statuses:
+            return HealthStatus.DEGRADED
+        return HealthStatus.UNHEALTHY
+
+    def summary(self) -> str:
+        """Generate a human-readable summary report."""
+        lines = []
+        lines.append("=" * 70)
+        lines.append("HEALTH CHECK REPORT")
+        lines.append("=" * 70)
+        lines.append(f"Overall Status: {self.overall_status.value.upper()}")
+        lines.append(f"Total Duration: {self.duration:.3f}s")
+        lines.append(f"Endpoints Checked: {len(self.results)}")
+        lines.append("-" * 70)
+
+        counts = {s: 0 for s in HealthStatus}
+        for r in self.results:
+            counts[r.status] += 1
+
+        lines.append(
+            f"  Healthy: {counts[HealthStatus.HEALTHY]}  |  "
+            f"Degraded: {counts[HealthStatus.DEGRADED]}  |  "
+            f"Unhealthy: {counts[HealthStatus.UNHEALTHY]}  |  "
+            f"Unknown: {counts[HealthStatus.UNKNOWN]}"
+        )
+        lines.append("-" * 70)
+
+        for r in self.results:
+            lines.append(f"\n[{r.status.value.upper()}] {r.name}")
+            lines.append(f"  URL: {r.url}")
+            lines.append(f"  Attempts: {r.attempts}")
+            lines.append(f"  Total Time: {r.total_time:.3f}s")
+            if r.status_code is not None:
+                lines.append(f"  Status Code: {r.status_code}")
+            if r.error:
+                lines.append(f"  Error: {r.error}")
+            if r.attempt_times:
+                times_str = ", ".join(f"{t:.3f}s" for t in r.attempt_times)
+                lines.append(f"  Attempt Times: [{times_str}]")
+
+        lines.append("=" * 70)
+        return "\n".join(lines)
+
+
+class HealthChecker:
+    """Asyncio-based HTTP health checker."""
+
+    def __init__(
+        self,
+        endpoints: List[EndpointConfig],
+        max_concurrency: int = 10,
+        session_factory=None,
+    ):
+        self.endpoints = endpoints
+        self.max_concurrency = max_concurrency
+        self._session_factory = session_factory
+        self._semaphore: Optional[asyncio.Semaphore] = None
+
+    def _compute_backoff(self, attempt: int, config: EndpointConfig) -> float:
+        """Compute exponential backoff with optional jitter."""
+        delay = min(config.base_backoff * (2 ** attempt), config.max_backoff)
+        if config.jitter:
+            delay = delay * (0.5 + random.random())
+        return delay
+
+    async def _check_once(
+        self, session, config: EndpointConfig
+    ) -> tuple:
+        """Perform a single HTTP request. Returns (success, status_code, error)."""
+        try:
+            async with session.request(
+                config.method,
+                config.url,
+                headers=config.headers,
+                timeout=aiohttp.ClientTimeout(total=config.timeout),
+            ) as response:
+                status_code = response.status
+                if status_code == config.expected_status:
+                    return True, status_code, None
+                return False, status_code, f"Unexpected status: {status_code}"
+        except asyncio.TimeoutError:
+            return False, None, "Timeout"
+        except aiohttp.ClientError as e:
+            return False, None, f"ClientError: {e}"
+        except Exception as e:
+            return False, None, f"Error: {e}"
+
+    async def check_endpoint(
+        self, session, config: EndpointConfig
+    ) -> CheckResult:
+        """Check a single endpoint with retries and exponential backoff."""
+        async with self._semaphore:
+            start = time.monotonic()
+            attempt_times: List[float] = []
+            last_status_code: Optional[int] = None
+            last_error: Optional[str] = None
+            attempts = 0
+
+            for attempt in range(config.max_retries + 1):
+                attempts = attempt + 1
+                attempt_start = time.monotonic()
+                success, status_code, error = await self._check_once(
+                    session, config
+                )
+                attempt_times.append(time.monotonic() - attempt_start)
+                last_status_code = status_code
+                last_error = error
+
+                if success:
+                    return CheckResult(
+                        name=config.name,
+                        url=config.url,
+                        status=HealthStatus.HEALTHY,
+                        attempts=attempts,
+                        total_time=time.monotonic() - start,
+                        status_code=status_code,
+                        attempt_times=attempt_times,
+                    )
+
+                if attempt < config.max_retries:
+                    delay = self._compute_backoff(attempt, config)
+                    await asyncio.sleep(delay)
+
+            return CheckResult(
+                name=config.name,
+                url=config.url,
+                status=HealthStatus.UNHEALTHY,
+                attempts=attempts,
+                total_time=time.monotonic() - start,
+                status_code=last_status_code,
+                error=last_error,
+                attempt_times=attempt_times,
+            )
+
+    async def run(self) -> HealthReport:
+        """Run all health checks concurrently and return a report."""
+        if aiohttp is None:
+            raise RuntimeError("aiohttp is required for HealthChecker")
+
+        self._semaphore = asyncio.Semaphore(self.max_concurrency)
+        start = time.monotonic()
+
+        session_factory = self._session_factory or aiohttp.ClientSession
+        async with session_factory() as session:
+            tasks = [
+                self.check_endpoint(session, config)
+                for config in self.endpoints
+            ]
+            results = await asyncio.gather(*tasks)
+
+        end = time.monotonic()
+        return HealthReport(
+            results=list(results),
+            start_time=start,
+            end_time=end,
+        )
+
+
+async def main():
+    """Example usage."""
+    endpoints = [
+        EndpointConfig(url="https://httpbin.org/status/200", name="httpbin-200"),
+        EndpointConfig(url="https://httpbin.org/status/500", name="httpbin-500"),
+        EndpointConfig(
+            url="https://httpbin.org/delay/1",
+            name="httpbin-delay",
+            timeout=2.0,
+        ),
+    ]
+    checker = HealthChecker(endpoints, max_concurrency=5)
+    report = await checker.run()
+    print(report.summary())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+## Tests
+
+```python
+# test_health_checker.py
+"""
+Tests for the asyncio HTTP health checker.
+"""
+
+import asyncio
+import time
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from health_checker import (
+    EndpointConfig,
+    HealthChecker,
+    HealthReport,
+    HealthStatus,
+    CheckResult,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def basic_endpoint():
+    return EndpointConfig(
+        url="http://example.com/health",
+        name="example",
+        max_retries=2,
+        base_backoff=0.01,
+        max_backoff=0.05,
+        jitter=False,
+    )
+
+
+def _make_mock_session(response_status=200, raise_exc=None):
+    """Build a mock aiohttp session whose request() returns a context manager."""
+    mock_response = MagicMock()
+    mock_response.status = response_status
+
+    mock_cm = MagicMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = MagicMock()
+    if raise_exc is not None:
+        mock_session.request = MagicMock(side_effect=raise_exc)
+    else:
+        mock_session.request = MagicMock(return_value=mock_cm)
+    return mock_session
+
+
+# ---------------------------------------------------------------------------
+# EndpointConfig tests
+# ---------------------------------------------------------------------------
+
+class TestEndpointConfig:
+    def test_default_name_is_url(self):
+        cfg = EndpointConfig(url="http://x.com")
+        assert cfg.name == "http://x.com"
+
+    def test_custom_name(self):
+        cfg = EndpointConfig(url="http://x.com", name="x")
+        assert cfg.name == "x"
+
+    def test_defaults(self):
+        cfg = EndpointConfig(url="http://x.com")
+        assert cfg.method == "GET"
+        assert cfg.expected_status == 200
+        assert cfg.timeout == 5.0
+        assert cfg.max_retries == 3
+        assert cfg.base_backoff == 0.5
+        assert cfg.max_backoff == 10.0
+        assert cfg.jitter is True
+        assert cfg.headers == {}
+
+
+# ---------------------------------------------------------------------------
+# Backoff tests
+# ---------------------------------------------------------------------------
+
+class TestBackoff:
+    def test_exponential_growth(self):
+        cfg = EndpointConfig(
+            url="http://x.com", base_backoff=1.0, max_backoff=100.0, jitter=False
+        )
+        checker = HealthChecker([cfg])
+        assert checker._compute_backoff(0, cfg) == 1.0
+        assert checker._compute_backoff(1, cfg) == 2.0
+        assert checker._compute_backoff(2, cfg) == 4.0
+        assert checker._compute_backoff(3, cfg) == 8.0
+
+    def test_max_backoff_cap(self):
+        cfg = EndpointConfig(
+            url="http://x.com", base_backoff=1.0, max_backoff=5.0, jitter=False
+        )
+        checker = HealthChecker([cfg])
+        assert checker._compute_backoff(10, cfg) == 5.0
+
+    def test_jitter_within_bounds(self):
+        cfg = EndpointConfig(
+            url="http://x.com", base_backoff=1.0, max_backoff=100.0, jitter=True
+        )
+        checker = HealthChecker([cfg])
+        for _ in range(50):
+            delay = checker._compute_backoff(2, cfg)  # base = 4.0
+            assert 2.0 <= delay <= 4.0
+
+
+# ---------------------------------------------------------------------------
+# check_endpoint tests
+# ---------------------------------------------------------------------------
+
+class TestCheckEndpoint:
+    @pytest.mark.asyncio
+    async def test_healthy_first_attempt(self, basic_endpoint):
+        checker = HealthChecker([basic_endpoint])
+        checker._semaphore = asyncio.Semaphore(1)
+        session = _make_mock_session(response_status=200)
+
+        result = await checker.check_endpoint(session, basic_endpoint)
+
+        assert result.status == HealthStatus.HEALTHY
+        assert result.attempts == 1
+        assert result.status_code == 200
+        assert result.error is None
+
+    @pytest.mark.asyncio
+    async def test_unexpected_status_retries_then_fails(self, basic_endpoint):
+        checker = HealthChecker([basic_endpoint])
+        checker._semaphore = asyncio.Semaphore(1)
+        session = _make_mock_session(response_status=500)
+
+        result = await checker.check_endpoint(session, basic_endpoint)
+
+        assert result.status == HealthStatus.UNHEALTHY
+        assert result.attempts == basic_endpoint.max_retries + 1
+        assert result.status_code == 500
+        assert "Unexpected status" in result.error
+
+    @pytest.mark.asyncio
+    async def test_recovers_after_retry(self, basic_endpoint):
+        """First attempt fails, second succeeds."""
+        checker = HealthChecker([basic_endpoint])
+        checker._semaphore = asyncio.Semaphore(1)
+
+        fail_response = MagicMock()
+        fail_response.status = 500
+        fail_cm = MagicMock()
+        fail_cm.__aenter__ = AsyncMock(return_value=fail_response)
+        fail_cm.__aexit__ = AsyncMock(return_value=False)
+
+        ok_response = MagicMock()
+        ok_response.status = 200
+        ok_cm = MagicMock()
+        ok_cm.__aenter__ = AsyncMock(return_value=ok_response)
+        ok_cm.__aexit__ = AsyncMock(return_value=False)
+
+        session = MagicMock()
+        session.request = MagicMock(side_effect=[fail_cm, ok_cm])
+
+        result = await checker.check_endpoint(session, basic_endpoint)
+
+        assert result.status == HealthStatus.HEALTHY
+        assert result.attempts == 2
+        assert result.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_timeout_handled(self, basic_endpoint):
+        checker = HealthChecker([basic_endpoint])
+        checker._semaphore = asyncio.Semaphore(1)
+        session = _make_mock_session(raise_exc=asyncio.TimeoutError())
+
+        result = await checker.check_endpoint(session, basic_endpoint)
+
+        assert result.status == HealthStatus.UNHEALTHY
+        assert result.error == "Timeout"
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_handled(self, basic_endpoint):
+        checker = HealthChecker([basic_endpoint])
+        checker._semaphore = asyncio.Semaphore(1)
+        session = _make_mock_session(raise_exc=RuntimeError("boom"))
+
+        result = await checker.check_endpoint(session, basic_endpoint)
+
+        assert result.status == HealthStatus.UNHEALTHY
+        assert "boom" in result.error
+
+    @pytest.mark.asyncio
+    async def test_attempt_times_recorded(self, basic_endpoint):
+        checker = HealthChecker([basic_endpoint])
+        checker._semaphore = asyncio.Semaphore(1)
+        session = _make_mock_session(response_status=500)
+
+        result = await checker.check_endpoint(session, basic_endpoint)
+
+        assert len(result.attempt_times) == basic_endpoint.max_retries + 1
+        assert all(t >= 0 for t in result.attempt_times)
+
+
+# ---------------------------------------------------------------------------
+# HealthReport tests
+# ---------------------------------------------------------------------------
+
+class TestHealthReport:
+    def _make_result(self, status):
+        return CheckResult(
+            name="x",
+            url="http://x.com",
+            status=status,
+            attempts=1,
+            total_time=0.1,
+        )
+
+    def test_overall_healthy(self):
+        report = HealthReport(
+            results=[
+                self._make_result(HealthStatus.HEALTHY),
+                self._make_result(HealthStatus.HEALTHY),
+            ],
+            start_time=0.0,
+            end_time=1.0,
+        )
+        assert report.overall_status == HealthStatus.HEALTHY
+
+    def test_overall_degraded(self):
+        report = HealthReport(
+            results=[
+                self._make_result(HealthStatus.HEALTHY),
+                self._make_result(HealthStatus.UNHEALTHY),
+            ],
+            start_time=0.0,
+            end_time=1.0,
+        )
+        assert report.overall_status == HealthStatus.DEGRADED
+
+    def test_overall_unhealthy(self):
+        report = HealthReport(
+            results=[
+                self._make_result(HealthStatus.UNHEALTHY),
+                self._make_result(HealthStatus.UNHEALTHY),
+            ],
+            start_time=0.0,
+            end_time=1.0,
+        )
+        assert report.overall_status == HealthStatus.UNHEALTHY
+
+    def test_overall_unknown_when_empty(self):
+        report = HealthReport(results=[], start_time=0.0, end_time=1.0)
+        assert report.overall_status == HealthStatus.UNKNOWN
+
+    def test_duration(self):
+        report = HealthReport(results=[], start_time=1.0, end_time=3.5)
+        assert report.duration == pytest.approx(2.5)
+
+    def test_summary_contains_key_info(self):
+        report = HealthReport(
+            results=[
+                CheckResult(
+                    name="api",
+                    url="http://api.com/health",
+                    status=HealthStatus.HEALTHY,
+                    attempts=1,
+                    total_time=0.05,
+                    status_code=200,
+                ),
+                CheckResult(
+                    name="db",
+                    url="http://db.com/health",
+                    status=HealthStatus.UNHEALTHY,
+                    attempts=3,
+                    total_time=1.2,
+                    error="Timeout",
+                ),
+            ],
+            start_time=0.0,
+            end_time=1.5,
+        )
+        summary = report.summary()
+        assert "HEALTH CHECK REPORT" in summary
+        assert "DEGRADED" in summary
+        assert "api" in summary
+        assert "db" in summary
+        assert "Timeout" in summary
+        assert "Status Code: 200" in summary
+
+
+# ---------------------------------------------------------------------------
+# HealthChecker.run integration tests
+# ---------------------------------------------------------------------------
+
+class TestHealthCheckerRun:
+    @pytest.mark.asyncio
+    async def test_run_returns_report(self):
+        endpoints = [
+            EndpointConfig(
+                url="http://a.com", name="a", max_retries=0, jitter=False
+            ),
+            EndpointConfig(
+                url="http://b.com", name="b", max_retries=0, jitter=False
+            ),
+        ]
+        checker = HealthChecker(endpoints, max_concurrency=2)
+
+        mock_session = _make_mock_session(response_status=200)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        def factory():
+            return mock_session
+
+        checker._session_factory = factory
+        report = await checker.run()
+
+        assert isinstance(report, HealthReport)
+        assert len(report.results) == 2
+        assert all(r.status == HealthStatus.HEALTHY for r in report.results)
+
+    @pytest.mark.asyncio
+    async def test_run_respects_concurrency(self):
+        """Ensure no more than max_concurrency checks run at once."""
+        active = 0
+        peak = 0
+        lock = asyncio.Lock()
+
+        async def fake_check(session, config):
+            nonlocal active, peak
+            async with lock:
+                active += 1
+                peak = max(peak, active)
+            await asyncio.sleep(0.02)
+            async with lock:
+                active -= 1
+            return CheckResult(
+                name=config.name,
+                url=config.url,
+                status=HealthStatus.HEALTHY,
+                attempts=1,
+                total_time=0.02,
+            )
+
+        endpoints = [
+            EndpointConfig(url=f"http://x{i}.com", name=f"x{i}")
+            for i in range(10)
+        ]
+        checker = HealthChecker(endpoints, max_concurrency=3)
+        checker.check_endpoint = fake_check
+
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        checker._session_factory = lambda: mock_session
+
+        await checker.run()
+        assert peak <= 3
+
+    @pytest.mark.asyncio
+    async def test_run_handles_mixed_results(self):
+        endpoints = [
+            EndpointConfig(
+                url="http://ok.com", name="ok", max_retries=0, jitter=False
+            ),
+            EndpointConfig(
+                url="http://bad.com", name="bad", max_retries=0, jitter=False
+            ),
+        ]
+        checker = HealthChecker(endpoints, max_concurrency=2)
+
+        ok_response = MagicMock()
+        ok_response.status = 200
+        ok_cm = MagicMock()
+        ok_cm.__aenter__ = AsyncMock(return_value=ok_response)
+        ok_cm.__aexit__ = AsyncMock(return_value=False)
+
+        bad_response = MagicMock()
+        bad_response.status = 500
+        bad_cm = MagicMock()
+        bad_cm.__aenter__ = AsyncMock(return_value=bad_response)
+        bad_cm.__aexit__ = AsyncMock(return_value=False)
+
+        def request_side_effect(method, url, **kwargs):
+            if "ok" in url:
+                return ok_cm
+            return bad_cm
+
+        mock_session = MagicMock()
+        mock_session.request = MagicMock(side_effect=request_side_effect)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        checker._session_factory = lambda: mock_session
+
+        report = await checker.run()
+
+        statuses = {r.name: r.status for r in report.results}
+        assert statuses["ok"] == HealthStatus.HEALTHY
+        assert statuses["bad"] == HealthStatus.UNHEALTHY
+        assert report.overall_status == HealthStatus.DEGRADED
+
+
+# ---------------------------------------------------------------------------
+# End-to-end style test with a real local aiohttp server
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_end_to_end_with_local_server():
+    """Spin up a real aiohttp server and verify the checker against it."""
+    aiohttp = pytest.importorskip("aiohttp")
+    from aiohttp import web
+
+    async def ok_handler(request):
+        return web.Response(status=200, text="ok")
+
+    async def fail_handler(request):
+        return web.Response(status=500, text="fail")
+
+    app = web.Application()
+    app.router.add_get("/ok", ok_handler)
+    app.router.add_get("/fail", fail_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+
+    # Discover the bound port
+    port = None
+    for sock in site._server.sockets:
+        port = sock.getsockname()[1]
+        break
+    assert port is not None
+
+    try:
+        endpoints = [
+            EndpointConfig(
+                url=f"http://127.0.0.1:{port}/ok",
+                name="ok",
+                max_retries=1,
+                base_backoff=0.01,
+                jitter=False,
+            ),
+            EndpointConfig(
+                url=f"http://127.0.0.1:{port}/fail",
+                name="fail",
+                max_retries=1,
+                base_backoff=0.01,
+                jitter=False,
+            ),
+        ]
+        checker = HealthChecker(endpoints, max_concurrency=2)
+        report = await checker.run()
+
+        statuses = {r.name: r.status for r in report.results}
+        assert statuses["ok"] == HealthStatus.HEALTHY
+        assert statuses["fail"] == HealthStatus.UNHEALTHY
+        assert report.overall_status == HealthStatus.DEGRADED
+    finally:
+        await runner.cleanup()
+```
+
+## `pytest.ini` (optional, for asyncio mode)
+
+```ini
+[pytest]
+asyncio_mode = auto
+```
+
+## `requirements.txt`
+
+```txt
+aiohttp>=3.9
+pytest>=7.4
+pytest-asyncio>=0.23
+```
+
+## Notes
+
+- **Retries & backoff**: `_compute_backoff` uses `base_backoff * 2**attempt`, capped at `max_backoff`, with optional jitter (`0.5x`–`1.5x`) to avoid thundering-herd effects.
+- **Concurrency**: A single `asyncio.Semaphore` bounds in-flight requests across all endpoints.
+- **Session injection**: `session_factory` allows tests to inject a mock session without patching `aiohttp`.
+- **Report**: `HealthReport.summary()` produces a readable text report; `overall_status` aggregates per-endpoint results (`HEALTHY` / `DEGRADED` / `UNHEALTHY` / `UNKNOWN`).
+- **Tests**: Cover config defaults, backoff math (growth, cap, jitter bounds), retry behavior (success, recovery, exhaustion), error handling (timeout, generic exception), report aggregation, concurrency limits, and a real end-to-end test against a local `aiohttp` server.

@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!csf_streaming
+!sitecustomize.py
+!vendor/deepseek_v41_encoding_1017.py
+!patches
+**/__pycache__

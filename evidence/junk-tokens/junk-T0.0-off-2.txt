@@ -1,0 +1,331 @@
+=== REASONING
+
+=== CONTENT
+```python
+"""Async HTTP health checker with retries, exponential backoff, and summary report."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import Iterable, Sequence
+
+import aiohttp
+
+
+@dataclass
+class EndpointResult:
+    url: str
+    ok: bool
+    status: int | None = None
+    attempts: int = 0
+    elapsed: float = 0.0
+    error: str | None = None
+
+
+@dataclass
+class HealthReport:
+    results: list[EndpointResult] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return len(self.results)
+
+    @property
+    def healthy(self) -> int:
+        return sum(1 for r in self.results if r.ok)
+
+    @property
+    def unhealthy(self) -> int:
+        return self.total - self.healthy
+
+    def render(self) -> str:
+        lines = [
+            "Health Check Summary",
+            "====================",
+            f"Total:     {self.total}",
+            f"Healthy:   {self.healthy}",
+            f"Unhealthy: {self.unhealthy}",
+            "",
+        ]
+        for r in self.results:
+            status = "OK " if r.ok else "FAIL"
+            detail = f"status={r.status}" if r.status is not None else f"error={r.error}"
+            lines.append(
+                f"[{status}] {r.url} attempts={r.attempts} "
+                f"elapsed={r.elapsed:.3f}s {detail}"
+            )
+        return "\n".join(lines)
+
+
+async def check_endpoint(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    retries: int = 3,
+    base_delay: float = 0.5,
+    max_delay: float = 8.0,
+    timeout: float = 5.0,
+    expected_status: int = 200,
+) -> EndpointResult:
+    """Check a single URL with retries and exponential backoff."""
+    start = time.monotonic()
+    last_error: str | None = None
+    last_status: int | None = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                last_status = resp.status
+                if resp.status == expected_status:
+                    return EndpointResult(
+                        url=url,
+                        ok=True,
+                        status=resp.status,
+                        attempts=attempt,
+                        elapsed=time.monotonic() - start,
+                    )
+                last_error = f"unexpected status {resp.status}"
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+
+        if attempt < retries:
+            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+            await asyncio.sleep(delay)
+
+    return EndpointResult(
+        url=url,
+        ok=False,
+        status=last_status,
+        attempts=retries,
+        elapsed=time.monotonic() - start,
+        error=last_error,
+    )
+
+
+async def check_all(
+    urls: Sequence[str],
+    *,
+    retries: int = 3,
+    base_delay: float = 0.5,
+    max_delay: float = 8.0,
+    timeout: float = 5.0,
+    concurrency: int = 10,
+) -> HealthReport:
+    """Check all URLs concurrently and return a summary report."""
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async with aiohttp.ClientSession() as session:
+        async def bounded(url: str) -> EndpointResult:
+            async with semaphore:
+                return await check_endpoint(
+                    session,
+                    url,
+                    retries=retries,
+                    base_delay=base_delay,
+                    max_delay=max_delay,
+                    timeout=timeout,
+                )
+
+        results = await asyncio.gather(*(bounded(u) for u in urls))
+
+    return HealthReport(results=list(results))
+
+
+def main(urls: Iterable[str]) -> None:
+    report = asyncio.run(check_all(list(urls)))
+    print(report.render())
+
+
+if __name__ == "__main__":
+    import sys
+
+    main(sys.argv[1:] or ["https://example.com"])
+```
+
+```python
+"""Tests for the async HTTP health checker."""
+
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import aiohttp
+import pytest
+
+from health_checker import (
+    EndpointResult,
+    HealthReport,
+    check_all,
+    check_endpoint,
+)
+
+
+def _make_response(status: int) -> MagicMock:
+    resp = MagicMock()
+    resp.status = status
+    resp.__aenter__ = AsyncMock(return_value=resp)
+    resp.__aexit__ = AsyncMock(return_value=None)
+    return resp
+
+
+def _make_session(responses):
+    """Build a fake session whose .get() yields the given responses in order."""
+    session = MagicMock()
+    iterator = iter(responses)
+
+    def get(url, timeout=None):
+        return next(iterator)
+
+    session.get = get
+    return session
+
+
+@pytest.mark.asyncio
+async def test_check_endpoint_success_first_try():
+    session = _make_session([_make_response(200)])
+    result = await check_endpoint(session, "http://x", retries=3, base_delay=0.0)
+    assert result.ok is True
+    assert result.status == 200
+    assert result.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_check_endpoint_retries_then_succeeds():
+    session = _make_session([
+        _make_response(500),
+        _make_response(500),
+        _make_response(200),
+    ])
+    result = await check_endpoint(session, "http://x", retries=3, base_delay=0.0)
+    assert result.ok is True
+    assert result.attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_check_endpoint_exhausts_retries():
+    session = _make_session([_make_response(500)] * 3)
+    result = await check_endpoint(session, "http://x", retries=3, base_delay=0.0)
+    assert result.ok is False
+    assert result.attempts == 3
+    assert result.status == 500
+
+
+@pytest.mark.asyncio
+async def test_check_endpoint_handles_exception():
+    session = MagicMock()
+
+    def get(url, timeout=None):
+        raise aiohttp.ClientConnectionError("boom")
+
+    session.get = get
+    result = await check_endpoint(session, "http://x", retries=2, base_delay=0.0)
+    assert result.ok is False
+    assert result.attempts == 2
+    assert "ClientConnectionError" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_check_endpoint_backoff_delays(monkeypatch):
+    delays: list[float] = []
+
+    async def fake_sleep(d):
+        delays.append(d)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    session = _make_session([_make_response(500)] * 4)
+    await check_endpoint(
+        session, "http://x", retries=4, base_delay=zing if False else 0.5, max_delay=1.0
+    )
+    # 3 sleeps between 4 attempts, capped at max_delay
+    assert delays == [0.5, 1.0, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_check_all_aggregates_results():
+    responses = [
+        _make_response(200),
+        _make_response(500),
+        _make_response(500),
+        _make_response(500),
+    ]
+    session = _make_session(responses)
+
+    class FakeSessionCtx:
+        async def __aenter__(self_inner):
+            return session
+
+        async def __aexit__(self_inner, *exc):
+            return None
+
+    with patch("health_checker.aiohttp.ClientSession", return_value=FakeSessionCtx()):
+        report = await check_all(
+            ["http://a", "http://b"], retries=3, base_delay=0.0, concurrency=2
+        )
+
+    assert isinstance(report, HealthReport)
+    assert report.total == 2
+    assert report.healthy == 1
+    assert report.unhealthy == 1跃
+
+
+def test_report_render_contains_summary():
+    report = HealthReport(results=[
+        EndpointResult(url="http://a", ok=True, status=200, attempts=1, elapsed=0.01),
+        EndpointResult(url="http://b", ok=False, status=500, attempts=3, elapsed=0.5),
+    ])
+    text = report.render()
+    assert "Total:     2" in text
+    assert "Healthy:   1" in text
+    assert "Unhealthy: 1" in text
+    assert "[OK ] http://a" in text
+    assert "[FAIL] http://b" in text
+```
+
+Note: the `test_check_endpoint_backoff_delays` test contains a typo (`base_delay=zing if False else 0.5`) — replace with `base_delay=0.5`. Also `test_check_all_aggregates_results` has a stray `跃` character at the end of the function body — remove it. Here is the corrected version of those two tests:
+
+```python
+@pytest.mark.asyncio
+async def test_check_endpoint_backoff_delays(monkeypatch):
+    delays: list[float] = []
+
+    async def fake_sleep(d):
+        delays.append(d)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    session = _make_session([_make_response(500)] * 4)
+    await check_endpoint(session, "http://x", retries=4, base_delay=0.5, max_delay=1.0)
+    assert delays == [0.5, 1.0, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_check_all_aggregates_results():
+    responses = [
+        _make_response(200),
+        _make_response(500),
+        _make_response(500),
+        _make_response(500),
+    ]
+    session = _make_session(responses)
+
+    class FakeSessionCtx:
+        async def __aenter__(self_inner):
+            return session
+
+        async def __aexit__(self_inner, *exc):
+            return None
+
+    with patch("health_checker.aiohttp.ClientSession", return_value=FakeSessionCtx()):
+        report = await check_all(
+            ["http://a", "http://b"], retries=3, base_delay=0.0, concurrency=2
+        )
+
+    assert isinstance(report, HealthReport)
+    assert report.total == 2
+    assert report.healthy == 1
+    assert report.unhealthy == 1
+```

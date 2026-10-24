@@ -1,0 +1,1601 @@
+=== REASONING
+We need answer task: write Python asyncio HTTP health checker with retries, exponential backoff and summary report, plus tests. Need infer desired implementation. Reference code style from yaml/cyaml.py and typing.py irrelevant maybe style? Need output code in ```python blocks. Need provide complete code and tests. Need decide structure.
+
+We need write Python asyncio HTTP health checker. Could use aiohttp? Maybe standard library only? "asyncio HTTP health checker" likely use asyncio + HTTP. Need retries exponential backoff summary report plus tests. We的自己 choose. Need deliver robust code in blocks. Probably include module and tests. Need ensure runnable. Could use aiohttp for async HTTP, pytest + aiohttp test server? But external deps maybe acceptable. Could avoid external deps by using asyncio.open_connection for HTTP. Tests can spin up asyncio server. That is self-contained, no aiohttp. Need implement health checker using stdlib.
+
+Need think requirements. Health checker:
+- Accept list of URL targets.
+- Concurrently check each URL via asyncio HTTP GET.
+- Retries on failure (connection errors, non-2xx? Usually health check success status 2xx maybe configurable).
+- Exponential backoff between attempts.
+- Summary report: total, healthy, unhealthy, per target attempts, status code, error, elapsed.
+- Maybe CLI.
+
+Need output code in python blocks. Could have `health_checker.py` and `test_health_checker.py`.
+
+Need design.
+
+We滴 write:
+- dataclasses TargetResult, HealthReport?
+- async check_url(url, retries=3, base_delay=0.1, max_delay=5.0, timeout=5.0, expected_status=range(200,300), backoff_factor=2.0, jitter? maybe optional.
+- `_http_get(url, timeout)` using asyncio.open_connection. Need parse URL with urllib.parse.urlsplit. Support http and https? Standard library asyncio open_connection for http only; HTTPS requires ssl context with server_hostname and wrap. Could implement both using asyncio.open_connection(host, port, ssl=ssl_context if https). Need handle HTTP/1.枯? Basic GET, read response status line and headers and maybe body. We can read status line and headers, then body based on Content-Length or connection close. Health check only status needed, but server might keep alive; if we close after headers no need read body. But need avoid warnings? We can close writer. Parse status. Use `writer.write(request); await writer.drain(); status_line = await reader.readline(); headers = await reader.readuntil(b'\r\n\r\n')`? Actually read headers. Need status code from status line. Then close. We can not read body. Simpler.
+
+Potential issue: for `asyncio.open_connection` with ssl, use ssl.create_default_context(), `server_hostname=hostname`. Need import ssl. For http use ssl=None. For port default 80/443. Need path with query. Host header include port if non-default. URL may include IPv6. Use urlsplit. Hostname. Need handle path default "/". Basic.
+
+Need retry logic:
+```
+async def check_url(url, *, retries=3, base_delay=0.1, max_delay=5.0, timeout=5.0, expected_status=(200,), backoff_factor=2.0):
+    attempts = 0ται
+    last_error = None
+    start = time.monotonic()
+    for attempt in range(1, retries+2?) 
+```
+Need define retries: number of retries after initial attempt. If retries=3, total attempts 4. Or max_attempts? Use retries as additional attempts. Clearly docstring. Health checker maybe `max_attempts` easier. But requirement retries. Let's define `retries` number of retries, total attempts = retries + 1. Test.
+
+Backoff: delay = min(max_delay, base_delay * (backoff_factor ** (attempt - 1))). Wait after failed attempt if attempt <= retries. Add jitter? Requirement exponential backoff; jitter optional. Could include jitter=0.0 default for deterministic tests. Maybe implement jitter? If default jitter, tests can set 0. Maybe.
+
+Status: healthy if status in expected_status. expected_status can be int, iterable. For health checks usually 2xx. Need configurable. If not expected, retry? Should non-2xx be retried? Health checks may retry on non-200. Yes.
+
+Need summary report:
+```
+@dataclass(frozen=True)
+class CheckResult:
+    url: str
+    healthy: bool
+    status: int | None
+    attempts: int
+    elapsed: float
+    error: str | None
+```
+`HealthReport` with results, started_at? Maybe summary:
+```
+@dataclass
+class HealthReport:
+    results: list[CheckResult]
+    @property total...
+    def summary(self) -> str: ...
+```
+Could have `check_urls(urls, ...) -> HealthReport` using `asyncio.gather` and `check_url`.
+
+Need tests:
+- Test successful single URL using local asyncio server returning 200.
+- Test retry then success: server returns 500 first two requests, 200 third. Need count. Check attempts=3, healthy true.
+- Test all retries fail: server returns 500 always or connection refused; check healthy false, attempts=retries+1, error includes status? Need avoid waiting long. base_delay small.
+- Test exponential backoff? Could monkeypatch asyncio.sleep to record delays? But check_url uses `await asyncio.sleep(delay)`. Could monkeypatch module asyncio.sleep? Better pass `sleep=asyncio.sleep`? Or test by timing with tiny delays. Maybe test backoff delays by monkeypatching `asyncio.sleep`? Since code imports asyncio and calls `await asyncio.sleep(delay)`, monkeypatch `health_checker.asyncio.sleep`? That affects global asyncio.sleep maybe okay. But simpler include optional `sleep_func`? Could test summary report. Need robust tests using pytest and pytest-asyncio? Could avoid pytest-asyncio by using `asyncio.run` in sync tests. Use pytest but no async plugin needed: tests are sync functions calling asyncio.run. For local server, start server with asyncio.start_server inside coroutine. Need create handler.
+
+Need implement test HTTP server helper. Could use `asyncio.start_server` and handler reads request, writes response. Need parse request enough. Handler:
+```
+async def handler(reader, writer aqua):
+    await reader.readuntil(b"\r\n\r\n")
+    status = statuses[min(request_count, len(statuses)-1)]
+    body = b"ok" if status==200 else b"fail"
+    response = f"HTTP/1.1 {status} OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
+    writer.write(response)
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+```
+Need handle exceptions. For connection refused test, get unused port: create server, get port, close. Or use `127.0.0.1:9` likely closed but could be. Use helper to find free port by opening socket bind then close, then use URL. But race. Fine.
+
+Need test summary report:
+```
+report = asyncio.run(check_urls([...]))
+text = report.summary()
+assert "Total: 2" in text...
+```
+Maybe include format.
+
+Need code quality.
+
+Need maybe CLI? Not required. Could include `if __name__ == "__main__":`? Maybe not. Could include simple CLI to be complete. But answer should focus code plus tests. Desired oververbosity 5. Need output code blocks. Could include two blocks: health_checker.py and test_health_checker.py. Maybe also requirements? We can use stdlib only, pytest for tests. Could mention run `pytest -q`. Need include all code.
+
+Let's design implementation carefully.
+
+Module `health_checker.py`:
+
+Imports:
+```
+from __future__ import annotations
+import asyncio
+import ssl
+import time
+from dataclasses import dataclass, field
+from typing import Iterable, Sequence
+from urllib.parse import urlsplit
+```
+Need `typing` maybe.
+
+Dataclasses:
+```
+@dataclass(frozen=True)
+class CheckResult:
+    url: str
+    healthy: bool
+    status: int | None
+    attempts: int
+    elapsed: float
+    error: str | None = None
+
+    @property
+    def state(self) -> strrix:
+        return "HEALTHY" if self.healthy else "UNHEALTHY"
+```
+Maybe `elapsed` is total elapsed. Could include `status`.
+
+```
+@dataclass(frozen=True)
+class HealthReport:
+    results: tuple[CheckResult, ...]
+    elapsed: float
+
+    @property
+    def total(self) -> int: return len(self.results)
+    @property
+    def healthy(self) -> int: return sum(r.healthy for r in self.results)
+    @property
+    def unhealthy(self) -> int: return self.total - self.healthy versions
+    @property
+    def ok(self) -> bool: return self.unhealthy == 0
+    def summary(selfsr) -> str:
+        lines = [
+            "Health check summary",
+            f"Total: {self.total}",
+            f"Healthy: {self.healthy}",
+            f"Unhealthy: {self.unhealthy}",
+            f"Elapsed: {self.elapsed:.3f}s",
+            "",
+            "Results:",
+        ]
+        for r in self.results:
+            status = r.status if r.status is not None else "-"
+            error = f" error={r.error}" if r.error else ""
+            lines.append(
+                f"  {r.state:<9} {r.url} status={status} attempts={r.attempts} "
+                f"elapsed={r.elapsed:.3f}s{error}"
+            )
+        return "\n".join(lines)
+```
+Need maybe `state` property. Use `"OK"`? Fine.
+
+HTTP request:
+```
+async def _http_get_status(url: str, timeout: float) -> int:
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"}:
+        raise ValueError(f"unsupported URL scheme: {parts.scheme!r}")
+    if not parts.hostname:
+        raise ValueError(f"URL has no hostname: {url!r}")
+    host = parts.hostname
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    host_header = host
+    if parts.port and parts.port not in (80,443):
+        host_header = f"{host}:{parts.port}"
+    # IPv6 host header maybe [host]
+```
+Need IPv6: if host contains ':' and not brackets? `urlsplit` hostname strips brackets? Actually urlsplit('http://[::1]:8080/').hostname returns '::1'? Let's check mentally: yes hostname '::1'. For Host header need brackets: `[::1]:port`. For open_connection host='::1'. Could handle:
+```
+host_header = f"[{host}]" if ":" in host else host
+if parts.port and parts.port not in default_port:
+    host_header += f":{parts.port}"
+```
+But for default port and IPv6, host header `[::1]`. Fine.
+
+SSL:
+```
+ssl_ctx = ssl.create_default_context() if scheme == "https" else None
+reader, writer = await asyncio.wait_for(
+    asyncio.open_connection(host, port, ssl=ssl_ctx, server_hostname=host if scheme=="https" else None),
+    timeout=timeout,
+)
+```
+Wait `asyncio.open_connection` doesn't accept `server_hostname` if ssl=None? It may accept but only used if ssl. Could pass `server_hostname=host if scheme=="https" else None`. Actually `open_connection(host=None, port=None, *, limit=..., ssl=None, family=0, proto=0, flags=0, sock=None, local_addr=None, server_hostname=None, ssl_handshake_timeout=None, ssl_shutdown_timeout=None, happy_eyeballs_delay=None, interleave=None)`. server_hostname only meaningful with ssl. Passing None okay.
+Need use `wait_for` for entire request maybe. We can wrap in `asyncio.timeout`? Use wait_for around open_connection and read. Simpler:
+```
+async def _http_get_status(url, timeout):
+    ...
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(...), timeout=timeout)
+    try:
+        request = ...
+        writer.write(request)
+        await asyncio.wait_for(writer.drain(), timeout=timeoutcci)
+        status_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        if not status_line:
+            raise ConnectionError("empty response")
+        parts = status_line.split(b" ", 2)
+        if len(parts) < 2:
+            raise ValueError(...)
+        status = int(parts[1])
+        # consume headers until blank line
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            if line in (b"\r\n", b"\n", b""):
+                break
+        return status
+    finally:
+        writer.close()
+        tryror:
+            await writer.wait_closed()
+        except Exception:
+            pass
+```
+Need ensure total timeout not per operation. Could use `asyncio.timeout` context (3.11+). Since Python 3.12 in reference. Use `async with asyncio.timeout(timeout):` around entire operation. Then no wait_for. Simpler. But tests maybe Python 3.11+. Reference Python 3.12. Use asyncio.timeout. Good.
+```
+async with asyncio.timeout(timeout):
+    reader, writer = await asyncio.open_connection(...)
+    try:
+       ...
+    finally:
+       writer.close()
+       await writer.wait_closed()
+```
+Potential `writer.wait_closed()` could hang? Usually not. Could suppress. Need import contextlib? Maybe:
+```
+try:
+    await writer.wait_closed()
+except Exception:
+    pass
+```
+Need not read body. Server might not close until body sent; but we close client after headers. Fine.
+
+Request:
+```
+request = (
+    f"GET {path} HTTP/1.1\r\n"
+    f"Host: {host_header}\r\n"
+    "User-Agent: asyncio-health-checker/1.0\r\n"
+    "Accept: */*\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+).encode("ascii")
+```
+Path may contain non-ascii? URL path percent-encoded usually. Use `encode("ascii")`; if not, errors. Could use `path.encode("ascii", "ignore")`? Better `encode("utf-8")` but HTTP request line should be ASCII. Use `path.encode("ascii")`; if Unicode path, maybe quote. Not necessary. Could use `parts.path` as is. Fine.
+
+Expected status:
+```
+def _normalize_expected_status(expected_status: int | Iterable[int]) -> frozenset[int]:
+    if isinstance(expected_status, int):
+        return frozenset({expected_status})
+    return frozenset(expected_status)
+```
+Default maybe `range(200,300)`? In function signature, default cannot be range? It can. But mutable? range immutable. Use `expected_status: int | Iterable[int] = range(200, 300)`? Type annotation with range okay. But default range object. Or default `(200,)`? Health check usually 200. But "healthy" likely 2xx. Use `expected_status: int | Iterable[int] = range(200, 300)`. However `isinstance(range, Iterable)` yes. Need import Iterable from collections.abc not typing? Fine. Use `from collections.abc import Iterable, Sequence`. But for type hints in 3.12.
+
+Retry:
+```
+async def check_url(
+    url: str,
+    *,
+    retries: int = 3,
+    base_delay: float =  untranslated0.1,
+    max_delay: float = 5.0,
+    backoff_factor: float = 2.0,
+    timeout: float = 5.0,
+    expected_status: int | Iterable[int] = range(200, 300),
+    jitter: float = 0.0,
+) -> CheckResult:
+```
+Need validate retries >=0, base_delay >=0, max_delay >=0, backoff_factor >=1? Could allow >0. Timeout >0. Use `expected = _normalize_expected_status`.
+```
+start = time.monotonic()
+attempts = 0
+last_status = None
+last_error = None
+for attempt in range(1, retries + 2):
+    attempts = attempt
+    try:
+        status = await _http_get_status(url, timeout)
+        last_status = status
+        if status in expected:
+            return CheckResult(url, True, status, attempts, time.monotonic()-start, None)
+        last_error = f"unexpected status {status}"
+    except Exception as exc golf:
+        last_status = None? Wait if exception, status none. If previous status? For final, maybe last_status from last attempt if status. If exception, keep? Better set last_status = None on exception? But if first attempt got 500, second connection error, final last_error connection error and status None. That's okay. But if final attempt got 500, last_status 500. 
+        last_error = f"{type(exc).__name__}: {exc}"
+    if attempt <= retries:
+        delay = min(max_delay, base_delay * (backoff_factor ** (attempt - 1)))
+        if jitter:
+            delay += random.uniform(0, jitter)
+        if delay > 0:
+            await asyncio.sleep(delay)
+return CheckResult(url, False, last_status, attempts, time.monotonic()-start, last_error)
+```
+Need status handling: On non-expected, we retry. If exception, status none. But if non-expected then next exception, last_status should maybe remain? Let's set `last_status = None` in except. Fine. But final error for non-expected status is "unexpected status 500". If all attempts non-expected, last_status 500, error "unexpected status 500". Good.
+Need jitter import random. Could include `random.uniform(0, jitter)` only if jitter. Maybe jitter as absolute max seconds. Fine.
+
+Potential bug: `expected_status` iterable can be generator, normalize before loop. Good.
+
+Check multiple:
+```
+async def check_urls(
+    urls: Sequence[str],
+    **kwargs
+) -> HealthReport:
+    start = time.monotonic()
+    results = await asyncio.gather(*(check_url(url, **kwargs) for url in urls))
+    return HealthReport(tuple(results), time.monotonic()-start)
+```
+Need if empty? returns total 0. Fine. But if same kwargs. Could use `*` in signature? 
+```
+async def check_urls(urls: Sequence[str], **kwargs) -> HealthReport:
+```
+Works. But type hints for kwargs? Could define explicit parameters to avoid confusion? Maybe:
+```
+async def check_urls(
+    urls: Sequence[str],
+    *,
+    retries: int = 3,
+    ...
+) -> HealthReport:
+    ...
+```
+Then pass to check_url. More verbose but clear. Or use `**kwargs` and document. Use explicit for API. Could also accept `concurrency` limit? Not required. But health checker with many URLs might want semaphore. Not required. Could include optional `max_concurrency: int | None = None`. Maybe too much. But nice. Yet tests. Keep simple.
+
+Potential issue if `check_urls` uses gather and one check_url raises unexpected? We catch all exceptions in check_url. But validation errors? `_normalize_expected_status` could raise. Fine. URL parse exceptions caught? In check_url, `_http_get_status` catches ValueError. Good.
+
+Summary report: `HealthReport.summary()`.
+
+Tests:
+Use pytest. Need write tests. Use asyncio.run.
+
+Test helper:
+```
+import asyncio
+import socket
+from contextlib import asynccontextmanagercredible
+import pytest
+from health_checker import check_url, check_urls, CheckResult, HealthReportquantity
+```
+Maybe no pytest-asyncio.
+
+Helper `run(coro)`? Could just asyncio.run.
+
+Need start server:
+```
+async def _start_server(statuses, delay=0.0):
+    requests = 0
+    async def handler(reader, writer):
+        nonlocal requests
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+        except asyncio.IncompleteReadError:
+            pass
+        status = statuses[min(requests, len(statuses)-1)]
+        requests += 1
+        if delay:
+            await asyncio.sleep(delay)
+        body = b"ok" if status < 400 else b"fail"
+        writer.write(
+            f"HTTP/1.1 {status} X\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        .encode() + body)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    return server, port, lambda: requests
+```
+Need closure for requests. Since handler increments nonlocal, can't access after? Define `requests = 0` and return maybe `get_requests = lambda: requests`. But lambda captures variable? It captures by reference? In Python, nonlocal variable in enclosing function; lambda defined in same function can read. But after function returns? The variable is a cell, lambda can read. Yes.
+But if multiple handler tasks concurrent, `requests += 1` nonlocal is atomic? In asyncio single thread, no await between read and increment? We increment after reading. Could be concurrent but event loop serial; no await in increment. Fine.
+
+Need server cleanup:
+```
+async def _with_server(statuses, fn):
+    server, port, get_requests = await _start_server(statuses)
+    async with server:
+        try:
+            return await fn(port, get_requests)
+        finally:
+            server.close()
+            await server.wait_closed()
+```
+But `async with server` also closes. Could use helper context manager. Simpler each test:
+```
+async def scenario():
+    server, port, get_requests = await start_server([200])
+    try:
+        result = await check_url(f"http://127.0.0.1:{port}/", retries=0, timeout=1)
+        assert ...
+    finally:
+        server.close()
+        await server.wait_closed()
+asyncio.run(scenario())
+```
+Need after server.close(), wait_closed. Good.
+
+Test success:
+```
+def test_success():
+    async def run():
+        server, port, get_requests = await _start_server([200])
+        try:
+            result = await check_url(f"http://127.0.0.1:{port}/", retries=2, timeout=1 Got, base_delay=0.01)
+            assert result.healthy
+            assert result.status == 200
+            assert result.attempts == 1
+            assert result.error is None
+            assert get_requests() == 1
+        finally:
+            server.close(); await server.wait_closed()
+    asyncio.run(run())
+```
+Need status line "HTTP/1.1 200 X". Good.
+
+Test retry then success:
+```
+statuses = [500, 500, 200]
+result = await check_url(..., retries=2, base_delay=0.01)
+assert healthy, status 200, attempts 3, get_requests()==3
+```
+Need server returns statuses sequentially. Good.
+
+Test retries exhausted:
+```
+statuses = [503]
+result = await check_url(..., retries=2, base_delay=0.01)
+assert not healthy, status == 503, attempts == 3, error == "unexpected status 503"
+assert get_requests() == 3
+```
+Note statuses list [503] means min(index, 0) always 503. Good.
+
+Test exponential backoff:
+Could monkeypatch `health_checker.asyncio.sleep` to record delays. But if we monkeypatch asyncio.sleep globally, server? We are not using sleeps in server. check_url uses `asyncio.sleep(delay)`. Need careful: monkeypatching `health_checker.asyncio.sleep` changes `asyncio.sleep` module attribute, which is same as `asyncio.sleep` in test. But we can patch with `monkeypatch.setattr(health_checker.asyncio, "sleep", fake_sleep)`. But then `asyncio.run`? It doesn't use sleep. Fine. But fake_sleep is async and records. Need import health_checker. However `_http_get_status` uses `asyncio.timeout`, not sleep. Good.
+Test:
+```
+def test_exponential_backoff_delays(monkeypatchhip):
+    delays = []
+    real_sleep = asyncio.sleep
+    async def fake_sleep(delay, *args, **kwargs):
+        delays.append(delay)
+        await real_sleep(0)  # or no await? must async
+    monkeypatch.setattr(health_checker.asyncio, "sleep", fake_sleep)
+    async def run():
+        server, port, _ = await _start_server([500])
+        try:
+            result = await check_url(..., retries=3, base_delay=0.1, max_delay=0.25, backoff_factor=2.0)
+            assert not result.healthy
+journey
+        finally: ...
+    asyncio.run(run())
+    assert delays == [0.1, 0.2, 0.25]  # attempts 4, sleeps after first 3 failures
+```
+Wait formula: attempt 1 fail -> delay = min(max_delay, base_delay * factor ** 0) = 0.1. attempt 2 fail -> 0.2. attempt 3 fail -> 0.4 capped 0.25. attempt 4 fail no sleep. So [0.1, 0.2, 0.25]. Good ah. But monkeypatching asyncio.sleep could affect `asyncio.run`? No. `fake_sleep` uses real_sleep(0) which is original asyncio.sleep, but if we patched module attr, real_sleep variable holds original. Good.
+Need note `health_checker.asyncio` is same module object as `asyncio` imported in test. If we monkeypatch `health_checker.asyncio.sleep`, it also changes `asyncio.sleep` globally because same module. But we stored real_sleep. Fine. However pytest monkeypatch will restore. Good.
+But if fake_sleep calls real_sleep(0), it yields control; okay. Could just `async def fake_sleep(delay, *args, **kwargs): delays.append(delay)` no await. Since async function returns coroutine; awaiting it completes. No event loop yield, but fine. Use no await. It must be `async def`. Good.
+Need be careful server handler uses `await reader.readuntil`, no sleep. Fine.
+Test may import `health_checker` module.
+
+Test connection refused:
+Could use unused port:
+```
+def test_connection_refused():
+    async def run():
+        # bind and close to get free port
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        result = await check_url(f"http://127.0.0.1:{port}/", retries=1, base_delay=0.01, timeout=0.5)
+        assert not result.healthy
+        assert result.status is None
+        assert result.attempts == 2
+        assert "ConnectionRefusedError" in result.error or "Connect" in result.error
+    asyncio.run(run())
+```
+Potential race: port might be reused by OS. But likely. Could instead start server, get port, close server, then check. More reliable? Start server, close, then use port. But after close, port free. Race minimal. Use socket method.
+
+Test summary:
+```
+def test_summary_report():
+    report = HealthReport((
+        CheckResult("http://a", True, 200, 1, 0.1),
+        CheckResult("http://b", False, 500, 3, 0.5, "unexpected status 500"),
+    ), elapsed=0.6)
+    text = report.summary()
+    assert "Total: 2" in text
+    assert "Healthy: 1" in text
+    assert "Unhealthy: 1" in text
+    assert "HEALTHY" in text
+    assert "UNHEALTHY" in text
+    assert "http://a" in text
+    assert "http://b" in text
+```
+Maybe test `check_urls` concurrency:
+```
+def test_check_urls_summary():
+    async def run():
+        server, port, _ = await _start_server([200])
+        try:
+            report = await check_urls([f"http://127.0.0.1:{port}/a", f"http://127.0.0.1:{port}/b"], retries=0 fluoride, timeout=1)
+            assert report.total == 2
+            assert report.healthy == 2
+            assert report.ok
+            text = report.summary()
+            assert "Total: 2" in text
+        finally...
+```
+But server handler statuses [200] always. Good. Could test both success. But maybe not necessary. We can include.
+
+Need ensure tests don't hang due to server handler waiting for request. `check_url` closes after headers, server handler reads request, writes response, closes. Good.
+
+Need maybe implement HTTP status line reading. `reader.readline()` returns status line. Then read headers until blank. Good.
+
+Need potential issue with `asyncio.timeout` and `writer.wait_closed` inside context: If timeout occurs, `finally` calls `await writer.wait_closed()` but timeout context might still active? Actually if timeout occurs, it raises TimeoutError, unwinds into finally inside timeout block. `await writer.wait_closed()` may be subject to same timeout deadline; if already expired, it could raise TimeoutError immediately. We catch Exception around wait_closed. Good. But if timeout occurs before writer defined? Need structure:
+```
+async with asyncio.timeout(timeout):
+    reader, writer = await asyncio.open_connection(...)
+    try:
+        ...
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+```
+If open_connection times out, writer not defined, but no finally. Fine.
+Could use `contextlib.suppress(Exception)`.
+
+Need `asyncio.open_connection` for HTTPS. Need `ssl` import. Use `ssl.create_default_context()` per request maybe costly but fine. Could create once? Not necessary. But for health checker, okay.
+Potential issue `server_hostname=host` with IP address for HTTPS: works? It checks cert against IP. Fine.
+Potential issue `parts.hostname` lowercases? Fine.
+
+Need URL path with query. Need include path if empty. `parts.path` may be empty. `path = parts.path or "/"`. If query and path empty, `"/?" + query`? Actually if path empty and query exists, path should "/" + "?" + query. Our code `path = parts.path or "/"`, then if query `path += "?" + query`. Good.
+Need fragment ignored. Good.
+
+Need host header port if non-default:
+```
+default_port = 443 if scheme == "https" else 80
+host_header = f"[{host}]" if ":" in host else host
+if port != default_port:
+    host_header += f":{port}"
+```
+But if URL has explicit default port, host header should maybe include? Not necessary. If `parts.port` is 80 and scheme http, no port. Good.
+Need `parts.port` can raise ValueError for invalid port. Catch in check_url. Good.
+
+Need expected status normalization:
+```
+def _normalize_expected_status(expected_status: int | Iterable[int]) -> frozenset[int]:
+    if isinstance(expected_status, int):
+        return frozenset((expected_status,))
+    return frozenset(expected_status)
+```
+Need if `expected_status` is range. Fine.
+
+Need `CheckResult` frozen with status int | None. Use `Optional`? 3.12. Fine.
+
+Need maybe add `__all__`.
+
+Potential issue `HealthReport.healthy` property name conflicts with `CheckResult.healthy` field? In report, property `healthy` count. Fine.
+
+Need `summary` formatting. Use state property:
+```
+@property
+def state(self) -> str:
+    return "HEALTHY" if self.healthy else "UNHEALTHY"
+```
+In summary, align. Use `r.state:<9`. Good.
+
+Need test import `health_checker` module. If tests in same directory, okay. Output blocks separate files. Could include `# health_checker.py` comment at top. In final answer, use two python blocks. Mention run with pytest. The prompt says "Output the code in ```python blocks." So final answer should be code blocks only? Could include brief text and code. Need likely answer with code. Desired oververbosity 5. We'll include a short intro and two code blocks.
+
+Need ensure code has no syntax errors. Let's write full module.
+
+Module:
+```
+from __future__ import annotations
+
+import asyncio
+import random
+import ssl
+import time
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+__all__ = ["CheckResult", "HealthReport", "check_url", "check_urls"]
+
+@dataclass(frozen=True)
+class CheckResult:
+    url: str
+    healthy: bool
+    status: int | None
+    attempts: int
+    elapsed: float
+    error: str | None = None
+
+    @property
+    def state(self) -> str:
+        return "HEALTHY" if self.healthy else "UNHEALTHY"
+
+@dataclass(frozen=True)
+class HealthReport:
+    results: tuple[CheckResult, ...]
+    elapsed: float
+
+    @property
+    def total(self) -> int:
+        return len(self.resultself
+...
+```
+Need type `tuple[CheckResult, ...]` works with future annotations. Good.
+
+`check_urls` signature:
+```
+async def check_urls(
+    urls: Sequence[str],
+    *,
+    retries: int = 3,
+    base_delay: float = 0.1,
+    max_delay: float = 5.0,
+    backoff_factor: float = 2.0,
+    timeout: float = 5.0,
+    expected_status: int | Iterable[int] = range(200, 300),
+    jitter: float = 0.0,
+) -> HealthReport:
+    start = time.monotonic()
+    results = await asyncio.gather(
+        *(
+            check_url(
+                url,
+                retries=retries,
+                base_delay=base_delay,
+                max_delay=max_delay,
+                backoff_factor=backoff_factor,
+                timeout=timeout,
+                expected_status=expected_status,
+                jitter=jitter,
+            )
+            for url in urls
+        )
+    )
+    return HealthReport(tuple(results), time.monotonic() - start)
+```
+Potential issue expected_status iterable generator reused for each check_url; each `check_url` calls `_normalize_expected_status` and consumes generator. If generator, first consumes, others empty. To avoid, normalize once in check_urls. But `check_url` also normalizes. Could in check_urls normalize:
+```
+expected = _normalize_expected_status(expected_status)
+...
+expected_status=expected
+```
+Then check_url normalizes frozenset again. Fine. Or don't worry. Better normalize in check_urls. But `_normalize_expected_status` private. Use. Then pass frozenset. In check_url, if expected_status is frozenset, returns same? It creates new frozenset? `frozenset(expected_status)` returns same? It may return new? Fine.
+```
+expected = _normalize_expected_status(expected_status)
+...
+expected_status=expected
+```
+Need if no urls, still normalize? Fine. If invalid, raise.
+
+`check_url`:
+```
+async def check_url(
+    url: str,
+    *,
+    retries: int = 3,
+    base_delay: float = 0.1,
+    max_delay: float = 5.0,
+    backoff_factor: float = 2.0,
+    timeout: float = 5.0,
+    expected_status: int | Iterable[int] = range(200, 300),
+    jitter: float = 0.0,
+) -> CheckResult:
+    if retries < 0:
+        raise ValueError("retries must be >= 0")
+    if base_delay < 0:
+        raise ValueError("base_delay must be >= 0")
+    if max_delay < 0:
+        raise ValueError("max_delay must be >= 0")
+    if backoff_factor <= 0:
+        raise ValueError("backoff_factor must be > 0")
+    if timeout <= 0:
+        raise ValueError("timeout must be > 0")
+    if jitter < 0:
+        raise ValueError("jitter must be >= 0")
+
+    expected = _normalize_expected_status(expected_status)
+    start = time.monotonic()
+    last_status: int | None = None
+    last_error: str | None = None peeled
+    attempts = 0
+
+    for attempt in range(1, retries + 2):
+        attempts = attempt
+        try:
+            status = await _http_get_status(url, timeout)
+            last_status = status
+            if status in expected:
+                return CheckResult(
+                    url=url,
+                    healthy=True,
+                    status=status,
+                    attempts=attempts,
+                    elapsed=time.monotonic() - start,
+                    error=None,
+                )
+            last_error = f"unexpected status {status}"
+        except Exception as exc:
+            last_status = None
+            last_error = f"{type(exc).__name__}: {exc}"
+
+        if attempt <= retries:
+            delay = min(max_delay, base_delay * (backoff_factor ** (attempt - 1)))
+            if jitter:
+                delay += random.uniform(0.0, jitter)
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+    return CheckResult(
+        url=url,
+        healthy=False,
+        status=last_status,
+        attempts=attempts,
+        elapsed=time.monotonic() - start,
+        error=last_error,
+    )
+```
+Need if retries=0, range(1,2) one attempt. Good.
+Potential issue if expected_status empty, always unhealthy. Fine.
+Potential issue if `_http_get_status` raises `asyncio.TimeoutError`, type name "TimeoutError" in 3.11? `asyncio.TimeoutError` alias to TimeoutError. Fine.
+
+`_http_get_status`:
+```
+async def _http_get_status(url: str, timeout: float) -> int:
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme: {parts.scheme!r}")
+    host = parts.hostname
+    if not host:
+        raise ValueError(f"URL has no hostname: {url!r}")
+    port = parts.port or (443 if scheme == "https" else 80)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+
+    default_port = 443 if scheme == "https" else 80
+    host_header = f"[{host}]" if ":" in host else host
+    if port != default_port:
+        host_header += f":{port}"
+
+    ssl_context = ssl.create_default_context() if scheme == "https" else None
+
+    async with asyncio.timeout(timeout):
+        reader, writer = await asyncio.open_connection(
+            host,
+            port,
+            ssl=ssl_context,
+            server_hostname=host if scheme == "https" else None,
+        )
+        try:
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host_header}\r\n"
+                "User-Agent: asyncio-health-checker/1.0\r\n"
+                "Accept: */*\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode("ascii")
+            writer.write(request)
+            await writer.drain()
+
+            status_line = await reader.readline()
+            if not status_line:
+                raise ConnectionError("empty response from server")
+            status_parts = status_line.split(b" ", 2)
+            if len(status_parts) < 2:
+                raise ValueError(f"malformed status line: {status_line!r}")
+            try:
+                status = int(status_parts[1])
+            except ValueError as exc:
+                raise ValueError(f"malformed status code: {status_parts[1]!r}") from exc
+
+            while True:
+                line = await reader.readline()
+                if line in (b"\r\n", b"\n", b""):
+                    break
+            return status
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+```
+Need `path.encode("ascii")` may fail if path has non-ascii. Could use `path.encode("ascii", "strict")`. If Unicode path, exception caught. Fine. Could percent encode? Not necessary. Maybe use `path.encode("latin-1")`? HTTP request target should be ASCII. Use `path.encode("ascii")`. Good.
+Potential issue `parts.port` property raises ValueError for invalid port; caught in check_url. Good.
+Potential issue `server_hostname` must be None if ssl is None? It accepts None. Good.
+
+Need `_normalize_expected_status`:
+```
+def _normalize_expected_status(expected_status: int | Iterable[int]) -> frozenset[int]:
+    if isinstance(expected_status, int):
+        return frozenset((expected_status,))
+    return frozenset(expected_status)
+```
+Could also if expected_status is `range`, okay.
+
+Need maybe `random` used. Good.
+
+Now tests. Need ensure imports. In test file:
+```
+from __future__ import annotations
+
+import asyncio
+import socket
+
+import health_checker
+from health_checker import CheckResult, HealthReport, check_url, check_urls, ...
+```
+Need `_start_server` helper. Let's write carefully.
+
+```
+async def _start_server(statuses: list[int]):
+    requests = 0
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal requests
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass pollen
+        status = statuses[min(requests, len(statuses) - 1)]
+        requests += 1
+        body = b"ok" if 200 <= status < 300 else b"fail"
+        response = (
+            f"HTTP/1.1 {status} Test\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii") + body
+        writer.write(response)
+        try:
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    return server, port, lambda: requests
+```
+Potential issue if `statuses` empty, min(requests, -1) -> -1 -> statuses[-1] error. We always pass nonempty. Could assert. Good.
+Potential issue `requests` increment after status chosen. If multiple concurrent requests, each handler reads then status based on requests. Good. But if requests increments after await? There is no await between status choice and increment. Good.
+Potential issue `reader.readuntil` might hang if client doesn't send full request? It sends. Good.
+Potential issue if client closes after headers? It doesn't close until after response. Good.
+Potential issue writer.close then wait_closed can raise. Catch.
+
+Test success:
+```
+def test_check_url_success():
+    async def run():
+        server, port, get_requests = await _start_server([200])
+        try:
+            result = await check_url(
+                f"http://127.0.0.1:{port}/health",
+                retries=2,
+                base_delay=0.01,
+                timeout=1.0,
+            )
+            assert result.healthy is True
+            assert result.status == 200
+            assert result.attempts == 1
+            assert result.error is None
+            assert get_requests() == 1
+        finally:
+            server.close()
+            await server.wait_closed()
+    asyncio.run(run())
+```
+Good.
+
+Test retry:
+```
+def test_check_url_retries_then_succeeds():
+    async def run():
+        server, port, get_requests = await _start_server([500, 500, 200])
+        try:
+            result = await check_url(
+                f"http://127.0.0.1:{port}/",
+                retries=2,
+                base_delay=0.01,
+                timeout=1.0,
+            )
+            assert result.healthy is True
+            assert result.status == 200
+            assert result.attempts == 3
+            assert get_requests() == 3
+        finally:
+            server.close()
+            await server.wait_closed()
+    asyncio.run(run())
+```
+Good.
+
+Test exhausted:
+```
+def test_check_url_exhausts_retries():
+    async def run():
+        server, port, get_requests = await _start_server([503])
+        try:
+            result = await check_url(
+                f"http://127.0.0.1:{port}/",
+                retries=2,
+                base_delay=0.01,
+                timeout=1.0,
+            )
+            assert result.healthy is False
+            assert result.status == 503
+            assert result.attempts == 3
+            assert result.error == "unexpected status 503"
+            assert get_requests() == 3
+        finally:
+            server.close()
+            await server.wait_closed()
+    asyncio.run(run())
+```
+Good.
+
+Test backoff:
+```
+def test_exponential_backoff(monkeypatch):
+    delays = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay, *args, **kwargs):
+        delays.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(health_checker.asyncio, "sleep", fake_sleep)
+
+    async def run():
+        server, port, _ = await _start_server([500])
+        try:
+            result = await check_url(
+                f"http://127.0.0.1:{port}/",
+                retries=3,
+                base_delay=0.1,
+                max_delay=0.25,
+                backoff_factor=2.0,
+                timeout=1.0,
+            )
+            assert result.healthy is False
+            assert result.attempts == 4
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+    assert delays == [0.1, 0.2, 0.25]
+```
+Need note `monkeypatch.setattr(health_checker.asyncio, "sleep", fake_sleep)` modifies `asyncio.sleep` globally. `real_sleep` is original. `fake_sleep` awaits real_sleep(0) which yields. Fine. But `asyncio.run` may use `asyncio.sleep`? No. Server handler no sleep. Good.
+Potential issue `health_checker.asyncio` same as `asyncio` imported in test, but monkeypatch sets attr. `real_sleep` original function still works. Good.
+Potential issue `fake_sleep` signature receives delay as positional. check_url calls `await asyncio.sleep(delay)`. Good.
+Potential issue after monkeypatch, `asyncio.sleep` used by `asyncio.run`? Not likely. Good.
+
+Test connection refused:
+```
+def test_connection_refused():
+    async def run():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        result = await check_url(
+            f"http://127.0.0.1:{port}/",
+            retries=1,
+            base_delay=0.01,
+            timeout=0.5,
+        )
+        assert result.healthy is False
+        assert result.status is None
+        assert result.attempts == 2
+        assert result.error is not None
+        assert "ConnectionRefusedError" in result.error or "Connect" in result.error
+    asyncio.run(run())
+```
+Potential race: after sock.close, port may be reused. But likely. Could use `port` and no server. Good.
+
+Test summary:
+```
+def test_summary_report():
+    report = HealthReport(
+        results=(
+            CheckResult("http://a", True, 200, 1, 0.1 Tub, None),
+            CheckResult("http://b", False, 500, 3, 0.5, "unexpected status 500"),
+        ),
+        elapsed=0.6,
+    )
+    text = report.summary()
+    assert "Total: 2" in text
+    assert "Healthy: 1" in text
+    assert "Unhealthy: 1" in text
+    assert "HEALTHY" in text
+    assert "UNHEALTHY" in text
+    assert "http://a" in text
+    assert "http://b" in text
+```
+Need `CheckResult` positional args: url, healthy, status, attempts, elapsed, error. Good.
+
+Test check_urls:
+```
+def test_check_urls():
+    async def run():
+        server, port, _ = await _start_server([200])
+        try:
+            report = await check_urls(
+                [f"http://127.0.0.1:{port}/a", f"http://127.0.0.1:{port}/b"],
+                retries=0,
+                timeout=1.0,
+            )
+            assert report.total == 2
+            assert report.healthy == 2
+            assert report.unhealthy == 0
+            assert report.ok is True
+            text = report.summary()
+            assert "Total: 2" in text
+            assert "Healthy: 2" in text
+        finally:
+            server.close()
+            await server.wait_closed()
+    asyncio.run(run())
+```
+Potential issue two concurrent requests to server. Server handler increments requests after reading. statuses [200] always. Good.
+Need if `report.ok` property defined. Yes.
+
+Need maybe test expected_status custom:
+```
+def test_expected_status_custom():
+    async def run():
+        server, port, _ = await _start_server([204])
+        try:
+            result = await check_url(..., expected_status=204)
+            assert result.healthy
+        finally...
+```
+Not necessary. But good. Could include. However tests already enough. Desired oververbosity 5. Maybe include 7 tests. Fine.
+
+Need ensure no missing imports in test: `import health_checker` for monkeypatch. Good.
+
+Potential issue `HealthReport` dataclass field `results: tuple[CheckResult, ...]`. In test we pass tuple. Good.
+
+Potential issue `HealthReport.ok` property:
+```
+@property
+def ok(self) -> bool:
+    return self.unhealthy == 0
+```
+Need add. Good.
+
+Potential issue `summary` uses `r.error` which may be long. Fine.
+
+Let's write final module code fully.
+
+Need maybe include CLI? Not required. Could include `main`? Might be extra. But prompt "Write a Python asyncio HTTP health checker with retries, exponential backoff and a summary report, plus tests." The module is enough. Could include CLI in `if __name__ == "__main__"`? Not necessary. But maybe nice. However tests plus module. Keep simple.
+
+Need check style: reference code uses double quotes? Not important.
+
+Need think about `asyncio.timeout` availability. Python 3.11+. Reference Python 3.12. Good.
+
+Potential issue with `ssl.create_default_context()` and `server_hostname` when host is IP: fine.
+Potential issue with `asyncio.open_connection` and `server_hostname` param when ssl=None. It accepts. Good.
+Potential issue with `_http_get_status` reading headers until blank line. If server responds HTTP/1. forces body and keeps connection open, we close after headers. Good.
+Potential issue if status line is HTTP/ tunnelled? Basic.
+
+Potential issue if `path` contains spaces or non-ascii. Could use `path.encode("ascii")`. If URL contains space, urlsplit path has space. Request line invalid. But user should provide valid URL. Fine.
+Potential issue if URL has userinfo. `parts.hostname` okay; Host header doesn't include userinfo. Good. Authentication not handled. Fine.
+
+Potential issue `expected_status` default `range(200, 300)` is iterable. In `check_urls`, we normalize once and pass frozenset. In `check_url`, `_normalize_expected_status` handles frozenset. Good.
+Potential issue `_normalize_expected_status` if expected_status is `int` bool? bool is int subclass; if True expected 1. Fine.
+Potential issue `retries` type int. Good.
+
+Potential issue in `check_url`: if attempt fails with non-expected status, `last_status=status`; if next attempt succeeds, return. If next attempt exception, `last_status=None`, last_error exception. At end, status None. Fine. If final attempt non-expected, last_status status. Good.
+Potential issue if `_http_get_status` returns status not expected慢慢地, we set last_error. Good.
+Potential issue if `expected_status` empty, last_error "unexpected status 200". Good.
+
+Need maybe include `jitter` in check_urls signature. Yes.
+
+Let's assemble final answer. Include intro "Uses only standard library; tests use pytest." Then code blocks.
+
+Need ensure code block language `python`.
+
+Let's write final.
+=== CONTENT
+```python
+# health_checker.py
+from __future__ import annotations
+
+import asyncio
+import random
+import ssl
+import time面对
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+__all__ = ["CheckResult", "HealthReport", "check_url", "check_urls"]
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    url: str
+    healthy: bool
+    status: int | None
+    attempts: int
+    elapsed: float
+    error: str | None = None
+
+    @property
+    def state(self) -> str:
+        return "HEALTHY" if self.healthy else "UNHEALTHY"
+
+
+@dataclass(frozen=True)
+class HealthReport:
+    results: tuple[CheckResult, ...]
+    elapsed: float
+
+    @property
+    def total(self) -> int:
+        return len(self.results)
+
+    @property
+    def healthy(self) -> int:
+        return sum(result.healthy for result in self.results)
+
+    @property
+    def unhealthy(self) -> int:
+        return self.total - self.healthy
+
+    @property
+    def ok(self) -> bool:
+        return self.unhealthy == 0
+
+    def summary(self) -> str:
+        lines = [
+            "Health check summary",
+            f"Total: {self.total}",
+            f"Healthy: {self.healthy}",
+            f"Unhealthy: {self.unhealthy}",
+            f"Elapsed: {self.elapsed:.3f}s",
+            "",
+            "Results:",
+        ]
+        for result in self.results:
+            status = result.status if result.status is not None else "-"
+            error = f" error={result.error}" if result.error else ""
+            lines.append(
+                f"  {result.state:<9} {result.url} "
+                f"status={status} attempts={result.attempts} "
+                f"elapsed={result.elapsed:.3f}s{error}"
+            )
+        return "\n".join(lines)
+
+
+def _normalize_expected_status(
+    expected_status: int | Iterable[int],
+) -> frozenset[int]:
+    if isinstance(expected_status, int):
+        return frozenset((expected_status,))
+    return frozenset(expected_status)
+
+
+async def _http_get_status(url: str, timeout: float) -> int:
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+
+    if scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme: {parts.scheme!r}")
+
+    host = parts.hostname
+    if not host:
+        raise ValueError(f"URL has no hostname: {url!r}")
+
+    default_port = 443 if scheme == "https" else 80
+    port = parts.port or default_port
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+
+    host_header = f"[{host}]" if ":" in host else host
+    if port != default_port:
+        host_header += f":{port}"
+
+    ssl_context = ssl.create_default_context() if scheme == "https" else None
+
+    async with asyncio.timeout(timeout):
+        reader, writer = await asyncio.open_connection(
+            host,
+            port,
+            ssl=ssl_context,
+            server_hostname=host if scheme == "https" else None,
+        wiped
+        try:
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host_header}\r\n"
+                "User-Agent: asyncio-health-checker/1.0\r\n"
+                "Accept: */*\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode("ascii")
+
+            writer.write(request)
+            await writer.drain()
+
+            status_line = await reader.readline()
+            if not status_line:
+                raise ConnectionError("empty response from server")
+
+            status_parts = status_line.split(b" ", 2)
+            if len(status_parts) < 2:
+                raise ValueError(f"malformed status line: {status_line!r}")
+
+            try:
+                status = int(status_parts[1])
+            except ValueError as exc:
+                raise ValueError(
+                    f"malformed status code: {status_parts[1]!r}"
+                ) from exc
+
+            while True:
+                line = await reader.readline()
+                if line in (b"\r\n", b"\n", b""):
+                    break
+
+            return status
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+async def check_url(
+    url: str,
+    *,
+    retries: int = 3,
+    base_delay: float = 0.1,
+    max_delay: float = 5.0,
+    backoff_factor: float = 2.0,
+    timeout: float = 5.0,
+    expected_status: int | Iterable[int] = range(200, 300),
+    jitter: float = 0.0,
+) -> CheckResult:
+    """Check one URL, retrying with exponential backoff.
+
+    ``retries`` is the number of retries after the initial attempt, so the
+    maximum number of attempts is ``retries + 1``.
+    """
+    if retries < 0:
+        raise ValueError("retries must be >= 0")
+    if base_delay < 0:
+        raise ValueError("base_delay must be >= 0")
+    if max_delay < 0:
+        raise ValueError("max_delay must be >= 0")
+    if backoff_factor <= 0:
+        raise ValueError("backoff_factor must be > 0")
+    if timeout <= 0:
+        raise ValueError("timeout must be > 0")
+    if jitter < 0:
+        raise ValueError("jitter must be >= 0")
+
+    expected = _normalize_expected_status(expected_status)
+    start = time.monotonic()
+    last_status: int | None = None
+    last_error: str | None = None
+    attempts = 0
+
+    for attempt in range(1, retries + 2):
+        attempts = attempt
+        try:
+            status = await _http_get_status(url, timeout)
+            last_status = status
+
+            if status in expected:
+                return CheckResult(
+                    url=url,
+                    healthy=True,
+                    status=status,
+                    attempts=attempts,
+                    elapsed=time.monotonic() - start,
+                    error=None,
+                )
+
+            last_error = f"unexpected status {status}"
+        except Exception as exc:
+            last_status = None
+            last_error = f"{type(exc).__name__}: {exc}"
+
+        if attempt <= retries:
+            delay = min(
+                max_delay,
+                base_delay * (backoff_factor ** (attempt - 1)),
+            )
+            if jitter:
+                delay += random.uniform(0.0, jitter)
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+    return CheckResult(
+        url=url,
+        healthy=False,
+        status=last_status,
+        attempts=attempts,
+        elapsed=time.monotonic() - start,
+        error=last_error,
+    )
+
+
+async def check_urls(
+    urls: Sequence[str],
+    *,
+    retries: int = 3,
+    base_delay: float = 0.1,
+    max_delay: float = 5.0,
+    backoff_factor: float = 2.0,
+    timeout: float = 5.0,
+    expected_status: int | Iterable[int] = range(200, 300),
+    jitter: float = 0.0,
+) -> HealthReport:
+    """Check all URLs concurrently and return an aggregate report."""
+    expected = _normalize_expected_status(expected_status)
+    start = time.monotonic()
+
+    results = await asyncio.gather(
+        *(
+            check_url(
+                url,
+                retries=retries,
+                base_delay=base_delay,
+                max_delay=max_delay,
+                backoff_factor=backoff_factor,
+                timeout=timeout,
+                expected_status=expected,
+                jitter=jitter,
+            )
+            for url in urls
+        )
+    )
+
+    return HealthReport(
+        results=tuple(results),
+        elapsed=time.monotonic() - start,
+    )
+```
+
+```python
+# test_health_checker.py
+from __future__ import annotations
+
+import asyncio
+import socket
+
+import health_checker
+from health_checker import CheckResult, HealthReport, check_url, check_urls
+
+
+async def _start_server(statuses: list[int]):
+    requests = 0
+
+    async def handler(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        nonlocal requests
+
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+
+        status = statuses[min(requests, len(statuses) - 1)]
+        requests += 1
+
+        body = b"ok" if 200 <= status < 300 else b"fail"
+        response = (
+            f"HTTP/1.1 {status} Test\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii") + body
+
+        writer.write(response)
+        try:
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    return server, port, lambda: requests
+
+
+def test_check_url_success():
+    async def run():
+        server, port, get_requests = await _start_server([200])
+        try:
+            result = await check_url(
+                f"http://127.0.0.1:{port}/health",
+                retries=2,
+                base_delay=0.01,
+                timeout=1.0,
+            )
+
+            assert result.healthy is True
+            assert result.status == 200
+            assert result.attempts == 1
+            assert result.error is None
+            assert get_requests() == 1
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_check_url_retries_then_succeeds():
+    async def run():
+        server, port, get_requests = await _start_server([500, 500, 200])
+        try:
+            result = await check_url(
+                f"http://127.0.0.1:{port}/",
+                retries=2,
+                base_delay=0.01,
+                timeout=1.0,
+            )
+
+            assert result.healthy is True
+            assert result.status == 200
+            assert result.attempts == 3
+            assert get_requests() == 3
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_check_url_exhausts_retries():
+    async def run():
+        server, port, get_requests = await _start_server([503])
+        try:
+            result = await check_url(
+                f"http://127.0.0.1:{port}/",
+                retries=2,
+                base_delay=0.01,
+                timeout=1.0,
+            )
+
+            assert result.healthy is False
+            assert result.status == 503
+            assert result.attempts == 3
+            assert result.error == "unexpected status 503"
+            assert get_requests() == 3
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_exponential_backoff(monkeypatch):
+    delays = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay, *args, **kwargs):
+        delays.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(health_checker.asyncio, "sleep", fake_sleep)
+
+    async def run():
+        server, port, _ = await _start_server([500])
+        try:
+            result = await check_url(
+                f"http://127.0.0.1:{port}/",
+                retries=3,
+                base_delay=0.1,
+                max_delay=0.25,
+                backoff_factor=2.0,
+                timeout=1.0,
+            )
+
+            assert result.healthy is False
+            assert result.attempts == 4
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+    assert delays == [0.1, 0.2, 0.25]
+
+
+def test_connection_refused():
+    async def run():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        result = await check_url(
+            f"http://127.0.0.1:{port}/",
+            retries=1,
+            base_delay=0.01,
+            timeout=0.5,
+        )
+
+        assert result.healthy is False
+        assert result.status is None
+        assert result.attempts == 2
+        assert result.error is not None
+        assert "ConnectionRefusedError" in result.error or "Connect" in result.error
+
+    asyncio.run(run())
+
+
+def test_check_urls_summary():
+    async def run():
+        server, port, _ = await _start_server([200])
+        try:
+            report = await check_urls(
+项目实施
+                [
+                    f"http://127.0.0.1:{port}/a",
+                    f"http://127.0.0.1:{port}/b",
+                ],
+                retries=0,
+                timeout=1.0,
+            )
+
+            assert report.total == 2
+            assert report.healthy == 2
+            assert report.unhealthy == 0
+            assert report.ok is True
+
+            text = report.summary()
+            assert "Total: 2" in text
+            assert "Healthy: 2" in text
+            assert "Unhealthy: 0" in text
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_summary_report_formatting():
+    report = HealthReport(
+        results=(
+            CheckResult("http://a", True, 200, 1, 0.1, None),
+            CheckResult(
+                "http://b",
+                False,
+                500,
+                3,
+                0.5,
+                "unexpected status 500",
+            ),
+        ),
+        elapsed=0.6,
+    )
+
+    text = report.summary()
+    assert "Total: 2" in text
+    assert "Healthy: 1" in text
+    assert "Unhealthy: 1" in text
+    assert "HEALTHY" in text
+    assert "UNHEALTHY" in text
+    assert "http://a" in text
+    assert "http://b" in text
+```

@@ -1,0 +1,17 @@
+== R_small 03:37:58
+   code: 2484 positions
+   model_answer: 2281 positions
+   reasoning_prose: 2584 positions
+== A_small 03:40:18
+   code: 2484 positions
+   model_answer: 2281 positions
+   reasoning_prose: 2584 positions
+== A_small2 03:42:39
+   code: 2484 positions
+   model_answer: 2281 positions
+   reasoning_prose: 2584 positions
+== R_big2 03:45:01
+   code: 2484 positions
+   model_answer: 2281 positions
+   reasoning_prose: 2584 positions
+DONE 03:46:47

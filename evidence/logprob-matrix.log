@@ -1,0 +1,158 @@
+== R_big 03:11:24
+   code: 2484 positions
+   model_answer: 2281 positions
+   reasoning_prose: 2584 positions
+== R_small 03:12:49
+   Traceback (most recent call last):
+     File "<repo>/scripts/logprob_eval.py", line 82, in <module>
+       collect(a) if a.cmd == "collect" else compare(a)
+       ^^^^^^^^^^
+     File "<repo>/scripts/logprob_eval.py", line 33, in collect
+       r = post(a.url + "/v1/completions", dict(model=a.model, prompt=text, max_tokens=1, temperature=0,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "<repo>/scripts/logprob_eval.py", line 27, in post
+       return json.load(urllib.request.urlopen(req, timeout=7200))
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 215, in urlopen
+       return opener.open(url, data, timeout)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 521, in open
+       response = meth(req, response)
+                  ^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 630, in http_response
+       response = self.parent.error(
+                  ^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 559, in error
+       return self._call_chain(*args)
+              ^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 492, in _call_chain
+       result = func(*args)
+                ^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 639, in http_error_default
+       raise HTTPError(req.full_url, code, msg, hdrs, fp)
+   urllib.error.HTTPError: HTTP Error 500: Internal Server Error
+== S_big 03:14:47
+   code: 2484 positions
+   model_answer: 2281 positions
+   reasoning_prose: 2584 positions
+== S_small 03:16:14
+   Traceback (most recent call last):
+     File "<repo>/scripts/logprob_eval.py", line 82, in <module>
+       collect(a) if a.cmd == "collect" else compare(a)
+       ^^^^^^^^^^
+     File "<repo>/scripts/logprob_eval.py", line 33, in collect
+       r = post(a.url + "/v1/completions", dict(model=a.model, prompt=text, max_tokens=1, temperature=0,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "<repo>/scripts/logprob_eval.py", line 27, in post
+       return json.load(urllib.request.urlopen(req, timeout=7200))
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 215, in urlopen
+       return opener.open(url, data, timeout)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 521, in open
+       response = meth(req, response)
+                  ^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 630, in http_response
+       response = self.parent.error(
+                  ^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 559, in error
+       return self._call_chain(*args)
+              ^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 492, in _call_chain
+       result = func(*args)
+                ^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 639, in http_error_default
+       raise HTTPError(req.full_url, code, msg, hdrs, fp)
+   urllib.error.HTTPError: HTTP Error 500: Internal Server Error
+== S_small2 03:18:13
+   Traceback (most recent call last):
+     File "<repo>/scripts/logprob_eval.py", line 82, in <module>
+       collect(a) if a.cmd == "collect" else compare(a)
+       ^^^^^^^^^^
+     File "<repo>/scripts/logprob_eval.py", line 33, in collect
+       r = post(a.url + "/v1/completions", dict(model=a.model, prompt=text, max_tokens=1, temperature=0,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "<repo>/scripts/logprob_eval.py", line 27, in post
+       return json.load(urllib.request.urlopen(req, timeout=7200))
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 215, in urlopen
+       return opener.open(url, data, timeout)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 521, in open
+       response = meth(req, response)
+                  ^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 630, in http_response
+       response = self.parent.error(
+                  ^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 559, in error
+       return self._call_chain(*args)
+              ^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 492, in _call_chain
+       result = func(*args)
+                ^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 639, in http_error_default
+       raise HTTPError(req.full_url, code, msg, hdrs, fp)
+   urllib.error.HTTPError: HTTP Error 500: Internal Server Error
+== A_big 03:20:11
+   code: 2484 positions
+   model_answer: 2281 positions
+   reasoning_prose: 2584 positions
+== A_small 03:21:37
+   Traceback (most recent call last):
+     File "<repo>/scripts/logprob_eval.py", line 82, in <module>
+       collect(a) if a.cmd == "collect" else compare(a)
+       ^^^^^^^^^^
+     File "<repo>/scripts/logprob_eval.py", line 33, in collect
+       r = post(a.url + "/v1/completions", dict(model=a.model, prompt=text, max_tokens=1, temperature=0,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "<repo>/scripts/logprob_eval.py", line 27, in post
+       return json.load(urllib.request.urlopen(req, timeout=7200))
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 215, in urlopen
+       return opener.open(url, data, timeout)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 521, in open
+       response = meth(req, response)
+                  ^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 630, in http_response
+       response = self.parent.error(
+                  ^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 559, in error
+       return self._call_chain(*args)
+              ^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 492, in _call_chain
+       result = func(*args)
+                ^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 639, in http_error_default
+       raise HTTPError(req.full_url, code, msg, hdrs, fp)
+   urllib.error.HTTPError: HTTP Error 500: Internal Server Error
+== A_small2 03:23:35
+   Traceback (most recent call last):
+     File "<repo>/scripts/logprob_eval.py", line 82, in <module>
+       collect(a) if a.cmd == "collect" else compare(a)
+       ^^^^^^^^^^
+     File "<repo>/scripts/logprob_eval.py", line 33, in collect
+       r = post(a.url + "/v1/completions", dict(model=a.model, prompt=text, max_tokens=1, temperature=0,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "<repo>/scripts/logprob_eval.py", line 27, in post
+       return json.load(urllib.request.urlopen(req, timeout=7200))
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 215, in urlopen
+       return opener.open(url, data, timeout)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 521, in open
+       response = meth(req, response)
+                  ^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 630, in http_response
+       response = self.parent.error(
+                  ^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 559, in error
+       return self._call_chain(*args)
+              ^^^^^^^^^^^^^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 492, in _call_chain
+       result = func(*args)
+                ^^^^^^^^^^^
+     File "/usr/lib64/python3.12/urllib/request.py", line 639, in http_error_default
+       raise HTTPError(req.full_url, code, msg, hdrs, fp)
+   urllib.error.HTTPError: HTTP Error 500: Internal Server Error
+DONE 03:25:53

@@ -1,0 +1,283 @@
+=== REASONING
+
+=== CONTENT
+```python
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Callable, Awaitable
+
+
+@dataclass
+class HealthCheckResult:
+    url: str
+    success: bool
+    attempts: int
+    elapsed: float
+    status_code: Optional[int] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class HealthCheckConfig:
+    max_retries: int = 3
+    base_delay: float = 0.1
+    max_delay: float = 5.0
+    backoff_factor: float = 2.0
+    timeout: float = 5.0
+
+
+async def _default_fetch(url: str, timeout: float) -> int:
+    """Default fetcher: performs a real HTTP GET and returns the status code."""
+    import urllib.request
+    import urllib.error
+
+    def _blocking() -> int:
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    return await asyncio.to_thread(_blocking)
+
+
+class HealthChecker:
+    def __init__(
+        self,
+        config: Optional[HealthCheckConfig] = None,
+        fetcher: Optional[Callable[[str, float], Awaitable[int]]] = None,
+    ):
+        self.config = config or HealthCheckConfig()
+        self.fetcher = fetcher or _default_fetch
+
+    def _backoff_delay(self, attempt: int) -> float:
+        delay = self.config.base_delay * (self.config.backoff_factor ** attempt)
+        return min(delay, self.config.max_delay)
+
+    async def check(self, url: str) -> HealthCheckResult:
+        start = time.monotonic()
+        last_error: Optional[str] = None
+        last_status: Optional[int] = None
+
+        for attempt in range(self.config.max_retries + 1):
+            try:
+                status = await self.fetcher(url, self.config.timeout)
+                last_status = status
+                if 200 <= status < 400:
+                    return HealthCheckResult(
+                        url=url,
+                        success=True,
+                        attempts=attempt + 1,
+                        elapsed=time.monotonic() - start,
+                        status_code=status,
+                    )
+                last_error = f"HTTP {status}"
+            except asyncio.TimeoutError:
+                last_error = "timeout"
+            except Exception as e:  # noqa: BLE001
+                last_error = f"{type(e).__name__}: {e}"
+
+            if attempt < self.config.max_retries:
+                await asyncio.sleep(self._backoff_delay(attempt))
+
+        return HealthCheckResult(
+            url=url,
+            success=False,
+            attempts=self.config.max_retries + 1,
+            elapsed=time.monotonic() - start,
+            status_code=last_status,
+            error=last_error,
+        )
+
+    async def check_all(self, urls: List[str]) -> List[HealthCheckResult]:
+        return await asyncio.gather(*(self.check(u) for u in urls))
+
+
+def summarize(results: List[HealthCheckResult]) -> Dict[str, object]:
+    total = len(results)
+    healthy = sum(1 for r in results if r.success)
+    unhealthy = total - healthy
+    total_attempts = sum(r.attempts for r in results)
+    total_elapsed = sum(r.elapsed for r in results)
+    return {
+        "total": total,
+        "healthy": healthy,
+        "unhealthy": unhealthy,
+        "total_attempts": total_attempts,
+        "total_elapsed": total_elapsed,
+        "results": results,
+    }
+
+
+def format_report(summary: Dict[str, object]) -> str:
+    lines = [
+        "Health Check Report",
+        "===================",
+        f"Total:     {summary['total']}",
+        f"Healthy:   {summary['healthy']}",
+        f"Unhealthy: {summary['unhealthy']}",
+        f"Attempts:  {summary['total_attempts']}",
+        f"Elapsed:   {summary['total_elapsed']:.3f}s",
+        "",
+        "Details:",
+    ]
+    for r in summary["results"]:  # type: ignore[union-attr]
+        status = "OK " if r.success else "FAIL"
+        detail = f"status={r.status_code}" if r.status_code is not None else f"error={r.error}"
+        lines.append(
+            f"  [{status}] {r.url} attempts={r.attempts} "
+            f"elapsed={r.elapsed:.3f}s {detail}"
+        )
+    return "\n".join(lines)
+
+
+async def main(urls: List[str]) -> int:
+    checker = HealthChecker()
+    results = await checker.check_all(urls)
+    summary = summarize(results)
+    print(format_report(summary))
+    return 0 if summary["unhealthy"] == 0 else 1
+
+
+if __name__ == "__main__":
+    import sys
+
+    urls = sys.argv[1:] or ["https://example.com"]
+    raise SystemExit(asyncio.run(main(urls)))
+```
+
+```python
+import asyncio
+import pytest
+
+from health_checker import (
+    HealthChecker,
+    HealthCheckConfig,
+    HealthCheckResult,
+    summarize,
+    format_report,
+)
+
+
+def make_fetcher(responses):
+    """responses: list of either int (status) or Exception instances."""
+    calls = {"n": 0}
+
+    async def fetcher(url, timeout):
+        idx = calls["n"]
+        calls["n"] += 1
+        item = responses[idx] if idx < len(responses) else responses[-1]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    return fetcher, calls
+
+
+@pytest.mark.asyncio
+async def test_success_first_try():
+    fetcher, calls = make_fetcher([200])
+    checker = HealthChecker(fetcher=fetcher)
+    result = await checker.check("http://x")
+    assert result.success
+    assert result.attempts == 1
+    assert result.status_code == 200
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_then_success():
+    fetcher, calls = make_fetcher([500, 500, 200])
+    cfg = HealthCheckConfig(max_retries=3, base_delay=0.0)
+    checker = HealthChecker(config=cfg, fetcher=fetcher)
+    result = await checker.check("http://x")
+    assert result.success
+    assert result.attempts == 3
+    assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_all_retries_fail():
+    fetcher, calls = make_fetcher([500, 500, 500, 500])
+    cfg = HealthCheckConfig(max_retries=3, base_delay=0.0)
+    checker = HealthChecker(config=cfg, fetcher=fetcher)
+    result = await checker.check("http://x")
+    assert not result.success
+    assert result.attempts == 4
+    assert result.status_code == 500
+    assert calls["n"] == 4
+
+
+@pytest.mark.asyncio
+async def test_exception_retries():
+    fetcher, calls = make_fetcher([ConnectionError("boom"), 200])
+    cfg = HealthCheckConfig(max_retries=2, base_delay=0.0)
+    checker = HealthChecker(config=cfg, fetcher=fetcher)
+    result = await checker.check("http://x")
+    assert result.success
+    assert result.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_timeout_retries():
+    fetcher, calls = make_fetcher([asyncio.TimeoutError(), 200])
+    cfg = HealthCheckConfig(max_retries=2, base_delay=0.0)
+    checker = HealthChecker(config=cfg, fetcher=fetcher)
+    result = await checker.check("http://x")
+    assert result.success
+    assert result.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_backoff_delay_capped():
+    cfg = HealthCheckConfig(base_delay=1.0, backoff_factor=10.0, max_delay=5.0)
+    checker = HealthChecker(config=cfg)
+    assert checker._backoff_delay(0) == 1.0
+    assert checker._backoff_delay(1) == 5.0
+    assert checker._backoff_delay(10) == 5.0
+
+
+@pytest.mark.asyncio
+async def test_check_all_concurrent():
+    async def fetcher(url, timeout):
+        await asyncio.sleep(0.01)
+        return 200 if "ok" in url else 500
+
+    cfg = HealthCheckConfig(max_retries=0)
+    checker = HealthChecker(config=cfg, fetcher=fetcher)
+    results = await checker.check_all(["http://ok1", "http://ok2", "http://bad"])
+    assert len(results) == 3
+    assert sum(1 for r in results if r.success) == 2
+
+
+def test_summarize_and_report():
+    results = [
+        HealthCheckResult("http://a", True, 1, 0.1, status_code=200),
+        HealthCheckResult("http://b", False, 3, 0.5, status_code=500, error="HTTP 500"),
+    ]
+    summary = summarize(results)
+    assert summary["total"] == 2
+    assert summary["healthy"] == 1
+    assert summary["unhealthy"] == 1
+    assert summary["total_attempts"] == 4
+    report = format_report(summary)
+    assert "Health Check Report" in report
+    assert "http://a" in report
+    assert "http://b" in report
+    assert "FAIL" in report
+    assert "OK " in report
+```
+
+```python
+# pytest.ini (or pyproject.toml [tool.pytest.ini_options])
+# [pytest]
+# asyncio_mode = auto
+```
+
+```python
+# requirements-dev.txt
+# pytest
+# pytest-asyncio
+```

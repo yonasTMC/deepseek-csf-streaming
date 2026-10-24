@@ -1,0 +1,395 @@
+=== REASONING
+
+=== CONTENT
+```python
+#!/usr/bin/env python3
+"""Aggregate per-endpoint latency percentiles from a JSON lines log file.
+
+Each input line is expected to be a JSON object with at least:
+    - "endpoint": str   -- the endpoint identifier (e.g. "/api/users")
+    - "latency_ms": num -- the request latency in milliseconds
+
+The script groups latencies by endpoint, computes p50/p90/p95/p99 (and
+min/max/count), and prints an aligned table to stdout.
+
+Usage:
+    python latency_report.py access.log
+    python latency_report.py access.log --percentiles 50 90 99 --sort p99
+    cat access.log | python latency_report.py -
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from collections import defaultdict
+from typing import Iterable, Iterator, Sequence
+
+
+DEFAULT_PERCENTILES: tuple[float, ...] = (50.0, 90.0, 95.0, 99.0)
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Aggregate per-endpoint latency percentiles from a "
+                    "JSON lines log file.",
+    )
+    parser.add_argument(
+        "path",
+        help="Path to the JSON lines log file, or '-' to read from stdin.",
+    )
+    parser.add_argument(
+        "--percentiles",
+        nargs="+",
+        type=float,
+        default=list(DEFAULT_PERCENTILES),
+        metavar="P",
+        help="Percentiles to compute (0-100). Default: %(default)s",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=("endpoint", "count", "min", "max", "mean", "p50", "p90",
+                 "p95", "p99"),
+        default="endpoint",
+        help="Column to sort the output by. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--reverse",
+        action="store_true",
+        help="Reverse the sort order.",
+    )
+    parser.add_argument(
+        "--skip-invalid",
+        action="store_true",
+        help="Silently skip malformed lines instead of failing.",
+    )
+    return parser.parse_args(argv)
+
+
+def iter_records(lines: Iterable[str], skip_invalid: bool = False) -> Iterator[dict]:
+    """Yield parsed JSON objects from an iterable of lines."""
+    for lineno, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            if skip_invalid:
+                continue
+            raise ValueError(f"line {lineno}: invalid JSON: {exc}") from exc
+        if not isinstance(record, dict):
+            if skip_invalid:
+                continue
+            raise ValueError(f"line {lineno}: expected a JSON object")
+        yield record
+
+
+def collect_latencies(
+    records: Iterable[dict],
+    skip_invalid: bool = False,
+) -> dict[str, list[float]]:
+    """Group latencies by endpoint."""
+    buckets: dict[str, list[float]] = defaultdict(list)
+    for record in records:
+        endpoint = record.get("endpoint")
+        latency = record.get("latency_ms")
+        if not isinstance(endpoint, str) or not isinstance(latency, (int, float)):
+            if skip_invalid:
+                continue
+            raise ValueError(
+                f"record missing valid 'endpoint'/'latency_ms': {record!r}"
+            )
+        buckets[endpoint].append(float(latency))
+    return dict(buckets)
+
+
+def percentile(sorted_values: Sequence[float], pct: float) -> float:
+    """Linear-interpolation percentile (same method as numpy's default)."""
+    if not sorted_values:
+        raise ValueError("cannot compute percentile of empty sequence")
+    if not 0.0 <= pct <= 100.0:
+        raise ValueError(f"percentile out of range: {pct}")
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    rank = (pct / 100.0) * (len(sorted_values) - 1)
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return sorted_values[int(rank)]
+    weight = rank - lower
+    return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def summarize(
+    buckets: dict[str, list[float]],
+    percentiles: Sequence[float],
+) -> list[dict]:
+    """Compute summary statistics for each endpoint."""
+    rows: list[dict] = []
+    for endpoint, values in buckets.items():
+        values.sort()
+        row: dict = {
+            "endpoint": endpoint,
+            "count": len(values),
+            "min": values[0],
+            "max": values[-1],
+            "mean": sum(values) / len(values),
+        }
+        for pct in percentiles:
+            row[f"p{pct:g}"] = percentile(values, pct)
+        rows.append(row)
+    return rows
+
+
+def sort_rows(rows: list[dict], key: str, reverse: bool) -> list[dict]:
+    if key == "endpoint":
+        return sorted(rows, key=lambda r: r["endpoint"], reverse=reverse)
+    return sorted(rows, key=lambda r: r[key], reverse=reverse)
+
+
+def format_table(rows: list[dict], percentiles: Sequence[float]) -> str:
+    """Render rows as a fixed-width aligned table."""
+    if not rows:
+        return "(no data)\n"
+
+    pct_cols = [f"p{pct:g}" for pct in percentiles]
+    columns = ["endpoint", "count", "min", "mean", "max", *pct_cols]
+
+    def fmt(value: object) -> str:
+        if isinstance(value, float):
+            return f"{value:.2f}"
+        return str(value)
+
+    widths = {col: len(col) for col in columns}
+    for row in rows:
+        for col in columns:
+            widths[col] = max(widths[col], len(fmt(row[col])))
+
+    header = "  ".join(col.rjust(widths[col]) for col in columns)
+    sep = "  ".join("-" * widths[col] for col in columns)
+    lines = [header, sep]
+    for row in rows:
+        lines.append("  ".join(fmt(row[col]).rjust(widths[col]) for col in columns))
+    return "\n".join(lines) + "\n"
+
+
+def run(
+    path: str,
+    percentiles: Sequence[float],
+    sort_key: str,
+    reverse: bool,
+    skip_invalid: bool,
+    out=sys.stdout,
+) -> int:
+    if path == "-":
+        lines: Iterable[str] = sys.stdin
+    else:
+        lines = open(path, "r", encoding="utf-8")
+
+    try:
+        records = iter_records(lines, skip_invalid=skip_invalid)
+        buckets = collect_latencies(records, skip_invalid=skip_invalid)
+    finally:
+        if path != "-":
+            lines.close()  # type: ignore[union-attr]
+
+    rows = summarize(buckets, percentiles)
+    rows = sort_rows(rows, sort_key, reverse)
+    out.write(format_table(rows, percentiles))
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        return run(
+            path=args.path,
+            percentiles=args.percentiles,
+            sort_key=args.sort,
+            reverse=args.reverse,
+            skip_invalid=args.skip_invalid,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+```python
+#!/usr/bin/env python3
+"""Tests for latency_report.py."""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import tempfile
+import unittest
+
+import latency_report as lr
+
+
+def _write_log(records: list[dict]) -> str:
+    fd, path = tempfile.mkstemp(suffix=".jsonl")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    return path
+
+
+class PercentileTests(unittest.TestCase):
+    def test_single_value(self) -> None:
+        self.assertEqual(lr.percentile([42.0], 50), 42.0)
+        self.assertEqual(lr.percentile([42.0], 99), 42.0)
+
+    def test_known_values(self) -> None:
+        data = [1.0, 2.0, 3.0, 4.0, 5.0]
+        self.assertAlmostEqual(lr.percentile(data, 0), 1.0)
+        self.assertAlmostEqual(lr.percentile(data, 50), 3.0)
+        self.assertAlmostEqual(lr.percentile(data, 100), 5.0)
+        # Linear interpolation between 4 and 5 at rank 3.6
+        self.assertAlmostEqual(lr.percentile(data, 90), 4.6)
+
+    def test_out_of_range(self) -> None:
+        with self.assertRaises(ValueError):
+            lr.percentile([1.0, 2.0], -1)
+        with self.assertRaises(ValueError):
+            lr.percentile([1.0, 2.0], 101)
+
+    def test_empty(self) -> None:
+        with self.assertRaises(ValueError):
+            lr.percentile([], 50)
+
+
+class CollectTests(unittest.TestCase):
+    def test_groups_by_endpoint(self) -> None:
+        records = [
+            {"endpoint": "/a", "latency_ms": 10},
+            {"endpoint": "/b", "latency_ms": 20},
+            {"endpoint": "/a", "latency_ms": 30},
+        ]
+        buckets = lr.collect_latencies(records)
+        self.assertEqual(buckets["/a"], [10.0, 30.0])
+        self.assertEqual(buckets["/b"], [20.0])
+
+    def test_invalid_record_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            lr.collect_latencies([{"endpoint": "/a"}])
+
+    def test_invalid_record_skipped(self) -> None:
+        buckets = lr.collect_latencies(
+            [{"endpoint": "/a"}, {"endpoint": "/b", "latency_ms": 5}],
+            skip_invalid=True,
+        )
+        self.assertEqual(buckets, {"/b": [5.0]})
+
+
+class IterRecordsTests(unittest.TestCase):
+    def test_skips_blank_lines(self) -> None:
+        lines = ['{"endpoint": "/a", "latency_ms": 1}\n', "\n", "   \n"]
+        records = list(lr.iter_records(lines))
+        self.assertEqual(len(records), 1)
+
+    def test_invalid_json_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            list(lr.iter_records(["not json\n"]))
+
+    def test_invalid_json_skipped(self) -> None:
+        records = list(lr.iter_records(["not json\n"], skip_invalid=True))
+        self.assertEqual(records, [])
+
+
+class SummarizeTests(unittest.TestCase):
+    def test_summary_fields(self) -> None:
+        buckets = {"/a": [10.0, 20.0, 30.0, 40.0]}
+        rows = lr.summarize(buckets, [50, 90])
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["endpoint"], "/a")
+        self.assertEqual(row["count"], 4)
+        self.assertEqual(row["min"], 10.0)
+        self.assertEqual(row["max"], 40.0)
+        self.assertAlmostEqual(row["mean"], 25.0)
+        self.assertAlmostEqual(row["p50"], 25.0)
+        self.assertAlmostEqual(row["p90"], 37.0)
+
+
+class FormatTableTests(unittest.TestCase):
+    def test_empty(self) -> None:
+        self.assertEqual(lr.format_table([], [50]), "(no data)\n")
+
+    def test_contains_headers_and_values(self) -> None:
+        rows = [{
+            "endpoint": "/a", "count": 2, "min": 1.0, "max": 3.0,
+            "mean": 2.0, "p50": 2.0,
+        }]
+        table = lr.format_table(rows, [50])
+        self.assertIn("endpoint", table)
+        self.assertIn("p50", table)
+        self.assertIn("/a", table)
+        self.assertIn("2.00", table)
+
+
+class RunTests(unittest.TestCase):
+    def test_end_to_end(self) -> None:
+        path = _write_log([
+            {"endpoint": "/a", "latency_ms": 10},
+            {"endpoint": "/a", "latency_ms": 20},
+            {"endpoint": "/b", "latency_ms": 100},
+        ])
+        try:
+            out = io.StringIO()
+            rc = lr.run(path, [50], "endpoint", False, False, out=out)
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("/a", text)
+            self.assertIn("/b", text)
+            self.assertIn("p50", text)
+        finally:
+            os.unlink(path)
+
+    def test_sort_by_count(self) -> None:
+        path = _write_log([
+            {"endpoint": "/a", "latency_ms": 1},
+            {"endpoint": "/b", "latency_ms": 1},
+            {"endpoint": "/b", "latency_ms": 2},
+        ])
+        try:
+            out = io.StringIO()
+            lr.run(path, [50], "count", True, False, out=out)
+            lines = out.getvalue().splitlines()
+            # Header, separator, then /b (count 2) before /a (count 1)
+            self.assertIn("/b", lines[2])
+            self.assertIn("/a", lines[3])
+        finally:
+            os.unlink(path)
+
+    def test_missing_file(self) -> None:
+        rc = lr.main(["/nonexistent/path.jsonl"])
+        self.assertEqual(rc, 1)
+
+
+class ArgparseTests(unittest.TestCase):
+    def test_defaults(self) -> None:
+        args = lr.parse_args(["log.jsonl"])
+        self.assertEqual(args.path, "log.jsonl")
+        self.assertEqual(tuple(args.percentiles), lr.DEFAULT_PERCENTILES)
+        self.assertEqual(args.sort, "endpoint")
+        self.assertFalse(args.reverse)
+        self.assertFalse(args.skip_invalid)
+
+    def test_custom_percentiles(self) -> None:
+        args = lr.parse_args(["log.jsonl", "--percentiles", "50", "99.9"])
+        self.assertEqual(args.percentiles, [50.0, 99.9])
+
+
+if __name__ == "__main__":
+    unittest.main()
+```

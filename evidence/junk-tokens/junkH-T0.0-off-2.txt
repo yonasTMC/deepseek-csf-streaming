@@ -1,0 +1,279 @@
+=== REASONING
+
+=== CONTENT
+```python
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import Optional, Callable, Awaitable
+
+
+@dataclass
+class HealthCheckResult:
+    url: str
+    success: bool
+    attempts: int
+    elapsed: float
+    status_code: Optional[int] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class HealthCheckConfig:
+    max_retries: int = 3
+    base_delay: float = 0.1
+    max_delay: float = 5.0
+    backoff_factor: float = 2.0
+    timeout: float = 5.0
+
+
+async def _default_fetch(url: str, timeout: float) -> int:
+    """Default fetcher: returns a status code. Replaceable for testing."""
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(url, 80), timeout=timeout
+    )
+    try:
+        writer.write(
+            f"HEAD / HTTP/1.1\r\nHost: {url}\r\nConnection: close\r\n\r\n".encode()
+        )
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        parts = line.decode(errors="replace").split()
+        if len(parts) >= 2 and parts[0].startswith("HTTP/"):
+            return int(parts[1])
+        raise ValueError(f"Malformed status line: {line!r}")
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+def _compute_delay(attempt: int, config: HealthCheckConfig) -> float:
+    delay = config.base_delay * (config.backoff_factor ** attempt)
+    return min(delay, config.max_delay)
+
+
+async def check_health(
+    url: str,
+    config: Optional[HealthCheckConfig] = None,
+    fetcher: Optional[Callable[[str, float], Awaitable[int]]] = None,
+) -> HealthCheckResult:
+    """Perform a health check with retries and exponential backoff."""
+    config = config or HealthCheckConfig()
+    fetcher = fetcher or _default_fetch
+    start = time.monotonic()
+    last_error: Optional[str] = None
+    last_status: Optional[int] = None
+
+    for attempt in range(config.max_retries + 1):
+        try:
+            status = await fetcher(url, config.timeout)
+            last_status = status
+            if 200 <= status < 400:
+                return HealthCheckResult(
+                    url=url,
+                    success=True,
+                    attempts=attempt + 1,
+                    elapsed=time.monotonic() - start,
+                    status_code=status,
+                )
+            last_error = f"HTTP {status}"
+        except asyncio.TimeoutError:
+            last_error = "timeout"
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{type(exc).__name__}: {exc}"
+
+        if attempt < config.max_retries:
+            await asyncio.sleep(_compute_delay(attempt, config))
+
+    return HealthCheckResult(
+        url=url,
+        success=False,
+        attempts=config.max_retries + 1,
+        elapsed=time.monotonic() - start,
+        status_code=last_status,
+        error=last_error,
+    )
+
+
+async def check_all(
+    urls: list[str],
+    config: Optional[HealthCheckConfig] = None,
+    fetcher: Optional[Callable[[str, float], Awaitable[int]]] = None,
+) -> list[HealthCheckResult]:
+    """Run health checks concurrently for all URLs."""
+    return await asyncio.gather(
+        *(check_health(u, config=config, fetcher=fetcher) for u in urls)
+    )
+
+
+def format_summary(results: list[HealthCheckResult]) -> str:
+    """Render a human-readable summary report."""
+    total = len(results)
+    healthy = sum(1 for r in results if r.success)
+    lines = [
+        "=" * 60,
+        f"Health Check Summary: {healthy}/{total} healthy",
+        "=" * 60,
+    ]
+    for r in results:
+        status = "OK  " if r.success else "FAIL"
+        detail = f"status={r.status_code}" if r.status_code is not None else ""
+        if r.error:
+            detail = f"{detail} error={r.error}".strip()
+        lines.append(
+            f"[{status}] {r.url:<40} attempts={r.attempts} "
+            f"elapsed={r.elapsed:.3f}s {detail}"
+        )
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+async def main(urls: list[str]) -> int:
+    results = await check_all(urls)
+    print(format_summary(results))
+    return 0 if all(r.success for r in results) else 1
+
+
+if __name__ == "__main__":
+    import sys
+
+    targets = sys.argv[1:] or ["example.com"]
+    raise SystemExit(asyncio.run(main(targets)))
+```
+
+```python
+import asyncio
+import pytest
+
+from health_checker import (
+    HealthCheckConfig,
+    check_all,
+    check_health,
+    format_summary,
+)
+
+
+def make_fetcher(responses):
+    """Build a fetcher that returns/raises from a list of responses in order."""
+    calls = {"n": 0}
+
+    async def fetcher(url, timeout):
+        idx = calls["n"]
+        calls["n"] += 1
+        item = responses[idx] if idx < len(responses) else responses[-1]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    fetcher.calls = calls
+    return fetcher
+
+
+@pytest.mark.asyncio
+async def test_success_first_try():
+    fetcher = make_fetcher([200])
+    result = await check_health("example.com", fetcher=fetcher)
+    assert result.success
+    assert result.attempts == 1
+    assert result.status_code == 200
+    assert fetcher.calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_then_success():
+    fetcher = make_fetcher([500, 503, 200])
+    cfg = HealthCheckConfig(max_retries=3, base_delay=0.0)
+    result = await check_health("example.com", config=cfg, fetcher=fetcher)
+    assert result.success
+    assert result.attempts == 3
+    assert fetcher.calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_exhausted_retries():
+    fetcher = make_fetcher([500])
+    cfg = HealthCheckConfig(max_retries=2, base_delay=0.0)
+    result = await check_health("example.com", config=cfg, fetcher=fetcher)
+    assert not result.success
+    assert result.attempts == 3
+    assert result.status_code == 500
+    assert fetcher.calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_retried():
+    fetcher = make_fetcher([asyncio.TimeoutError(), 200])
+    cfg = HealthCheckConfig(max_retries=2, base_delay=0.0)
+    result = await check_health("example.com", config=cfg, fetcher=fetcher)
+    assert result.success
+    assert result.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_exception_is_retried():
+    fetcher = make_fetcher([ConnectionError("boom"), 200])
+    cfg = HealthCheckConfig(max_retries=2, base_delay=0.0)
+    result = await check_health("example.com", config=cfg, fetcher=fetcher)
+    assert result.success
+    assert result.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_backoff_delay_grows():
+    from health_checker import _compute_delay
+
+    cfg = HealthCheckConfig(base_delay=0.1, backoff_factor=2.0, max_delay=10.0)
+    assert _compute_delay(0, cfg) == pytest.approx(0.1)
+    assert _compute_delay(1, cfg) == pytest.approx(0.2)
+    assert _compute_delay(2, cfg) == pytest.approx(0.4)
+
+
+@pytest.mark.asyncio
+async def test_backoff_capped():
+    from health_checker import _compute_delay
+
+    cfg = HealthCheckConfig(base_delay=1.0, backoff_factor=10.0, max_delay=5.0)
+    assert _compute_delay(5, cfg) == 5.0
+
+
+@pytest.mark.asyncio
+async def test_check_all_concurrent():
+    async def fetcher(url, timeout):
+        await asyncio.sleep(0.05)
+        return 200 if "good" in url else 500
+
+    cfg = HealthCheckConfig(max_retries=0)
+    results = await check_all(
+        ["good1", "good2", "bad1"], config=cfg, fetcher=fetcher
+    )
+    assert [r.success for r in results] == [True, True, False]
+
+
+def test_format_summary():
+    from health_checker import HealthCheckResult
+
+    results = [
+        HealthCheckResult("a.com", True, 1, 0.01, status_code=200),
+        HealthCheckResult("b.com", False, 3, 0.5, status_code=500, error="HTTP 500"),
+    ]
+    text = format_summary(results)
+    assert "1/2 healthy" in text
+    assert "[OK  ] a.com" in text
+    assert "[FAIL] b.com" in text
+    assert "attempts=3" in text
+```
+
+```python
+# pytest.ini (or pyproject.toml [tool.pytest.ini_options])
+# [pytest]
+# asyncio_mode = auto
+```
+
+```python
+# requirements-dev.txt
+# pytest
+# pytest-asyncio
+```
