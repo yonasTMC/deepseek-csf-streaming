@@ -20,6 +20,7 @@
 
 #include <cstdio>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -39,7 +40,11 @@ namespace {
 constexpr int kHeader = 8;   // box: seq ack count miss npred error fill_done reserved
 constexpr int kMaxFill = 128;
 constexpr int kSameLayerHint = 1 << 20;  // prediction ids >= this: read ahead for this layer
-constexpr int kAckWords = 2 + 2 * kMaxFill + kMaxFill;  // nfill nevict, fills, evictions
+// ack: nfill nevict | fills (expert<<32|slot, source) | evictions | per-fill ready (= seq when its
+// source bytes are in host memory). The GPU copies each fill once its flag is set, so RAM-tier
+// copies run while NVMe reads for the same request are still in flight.
+constexpr int kAckReady = 2 + 3 * kMaxFill;
+constexpr int kAckWords = kAckReady + kMaxFill;
 constexpr int kMaxFields = 8;
 
 __device__ __forceinline__ long long ld_acquire_sys(const long long* p) {
@@ -86,6 +91,7 @@ __global__ void wait_fill_kernel(long long* dev_state, long long* box, const lon
                                  Fields fields, long long timeout_ns) {
   __shared__ int go;
   __shared__ int nfill;
+  __shared__ long long seq_s, start_s;
   __shared__ int fill_slot[kMaxFill];
   __shared__ long long fill_src[kMaxFill];
   if (threadIdx.x == 0) {
@@ -94,6 +100,7 @@ __global__ void wait_fill_kernel(long long* dev_state, long long* box, const lon
       long long seq = dev_state[0];
       unsigned long long start, now;
       asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+      seq_s = seq; start_s = static_cast<long long>(start);
       go = 1;
       while (ld_acquire_sys(box + 1) < seq) {
         __nanosleep(256);
@@ -123,6 +130,25 @@ __global__ void wait_fill_kernel(long long* dev_state, long long* box, const lon
   __syncthreads();
   const long long G = gridDim.x, b = blockIdx.x;
   for (int e = 0; e < nfill; ++e) {
+    if (threadIdx.x == 0) {
+      // Wait until this fill's source bytes are in host memory (RAM-tier fills come first and
+      // are ready at once; NVMe fills become ready as their reads complete).
+      unsigned long long now;
+      while (ld_acquire_sys(ack + kAckReady + e) < seq_s) {
+        __nanosleep(256);
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+        if (static_cast<long long>(now) - start_s > timeout_ns) {
+          if (blockIdx.x == 0) {
+            reinterpret_cast<volatile long long*>(box)[5] = seq_s;
+            __threadfence_system();
+          }
+          go = 0;
+          break;
+        }
+      }
+    }
+    __syncthreads();
+    if (!go) return;
     long long src = fill_src[e];
     int slot = fill_slot[e];
     for (int f = 0; f < fields.count; ++f) {
@@ -368,7 +394,7 @@ class Service {
       }
       // Sources: RAM tier, ready read-ahead buffer, in-flight read-ahead, or a demand read.
       sources.resize(fills.size(), 0);
-      std::vector<int> used;
+      std::vector<int> used, buf_of(fills.size(), -1);
       {
         std::unique_lock<std::mutex> lock(mu);
         tick++;
@@ -394,21 +420,39 @@ class Service {
           bufs[b].lock_layer = L.id;     // lock now: later fills in this request must not evict it
           bufs[b].lock_seq = seq;
           used.push_back(b);
+          buf_of[i] = b;
           sources[i] = reinterpret_cast<long long>(cache_base + static_cast<long long>(b) * stride);
         }
+        // Ready fills first: the GPU copies them while the remaining reads are in flight.
+        std::vector<size_t> order(fills.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::stable_partition(order.begin(), order.end(),
+                              [&](size_t i) { return buf_of[i] < 0 || bufs[buf_of[i]].state == 2; });
+        vstore(ack + 0, static_cast<long long>(fills.size()));
+        vstore(ack + 1, static_cast<long long>(evicted.size()));
+        for (size_t k = 0; k < order.size(); ++k) {
+          size_t i = order[k];
+          vstore(ack + 2 + 2 * k, (static_cast<long long>(fills[i].first) << 32) | fills[i].second);
+          vstore(ack + 3 + 2 * k, sources[i]);
+        }
+        for (size_t i = 0; i < evicted.size(); ++i) vstore(ack + 2 + 2 * kMaxFill + i, evicted[i]);
+        size_t k = 0;
+        for (; k < order.size(); ++k) {
+          int b = buf_of[order[k]];
+          if (b >= 0 && bufs[b].state != 2) break;
+          vstore(ack + kAckReady + k, seq);
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+        vstore(box + 1, seq);
         long long w0 = now_ns();
-        for (int b : used) cv.wait(lock, [&] { return bufs[b].state == 2 || !fatal.empty(); });
+        for (; k < order.size(); ++k) {
+          int b = buf_of[order[k]];
+          cv.wait(lock, [&] { return bufs[b].state == 2 || !fatal.empty(); });
+          std::atomic_thread_fence(std::memory_order_release);
+          vstore(ack + kAckReady + k, seq);
+        }
         L.st.read_wait_ns += now_ns() - w0;
       }
-      vstore(ack + 0, static_cast<long long>(fills.size()));
-      vstore(ack + 1, static_cast<long long>(evicted.size()));
-      for (size_t i = 0; i < fills.size(); ++i) {
-        vstore(ack + 2 + 2 * i, (static_cast<long long>(fills[i].first) << 32) | fills[i].second);
-        vstore(ack + 3 + 2 * i, sources[i]);
-      }
-      for (size_t i = 0; i < evicted.size(); ++i) vstore(ack + 2 + 2 * kMaxFill + i, evicted[i]);
-      std::atomic_thread_fence(std::memory_order_release);
-      vstore(box + 1, seq);
     } else {
       L.st.hits += requested.size();
     }

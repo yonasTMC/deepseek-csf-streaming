@@ -319,6 +319,10 @@ class FastExpertCache:
         self.prefill_min_votes = env_int("CSF_PREFILL_MIN_VOTES", 1)
         self.plans = {}
         self.shared = shared(rank, self.device)
+        # Optional per-layer slot counts from the placement: busier layers get more slots,
+        # quieter ones fewer, at the same total VRAM (scripts/layer_budget.py).
+        capacity = int(self.shared.placement.get("capacity", {}).get(str(layer), capacity))
+        self.capacity = capacity
         # Split pack: slot s holds the half-width experts 2s and 2s+1 (the TP4
         # slices of this rank), which the deterministic kernel runs fast.
         self.split = self.shared.pack.meta.get("split", 1)
@@ -752,7 +756,7 @@ class FastExpertCache:
     def plan_for(self, count, topk, device):
         from b12x.moe import fused_moe as fm
         from b12x.moe.fused_moe._tuning import MoeDecodeConfig
-        key = count, topk
+        key = count, topk, self.capacity      # per-layer capacities need their own plans
         if key not in self.plans:
             # "auto" lets B12X pick its decode kernel (about 17x faster for one
             # token than the pinned deterministic M16 kernel used by the v1 tests).
@@ -767,9 +771,19 @@ class FastExpertCache:
                 max_tokens=count, num_topk=topk, device=device,
                 weight_plan=self.prepared._impl.plan, quant_mode="w4a8_mx",
                 swiglu_limit=self.limit, **extra))
-            scratch = torch.empty(sum(s.nbytes for s in plan.scratch_specs()), dtype=torch.uint8, device=device)
-            self.plans[key] = plan, scratch
-        return self.plans[key]
+            nbytes = sum(s.nbytes for s in plan.scratch_specs())
+            if self.split > 1:
+                # Split plans run one at a time on the compute stream, so all layers share one
+                # scratch buffer sized for the largest plan. Every plan is made in __init__,
+                # before graph capture, and bindings are made per call, so growing it is safe.
+                buf = getattr(self.shared, "split_scratch", None)
+                if buf is None or buf.numel() < nbytes:
+                    self.shared.split_scratch = torch.empty(nbytes, dtype=torch.uint8, device=device)
+                self.plans[key] = plan, None
+            else:
+                self.plans[key] = plan, torch.empty(nbytes, dtype=torch.uint8, device=device)
+        plan, scratch = self.plans[key]
+        return plan, scratch if scratch is not None else self.shared.split_scratch
 
     def run_slots(self, x, topk_weights, slots):
         """Split pack: run slot routes as half-expert routes sharing each gate."""

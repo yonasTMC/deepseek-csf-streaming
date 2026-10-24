@@ -28,12 +28,21 @@ def learn(a):
     for layer, ids in decode_calls(a.traces, a.max_tokens):
         freq[layer].update(int(e) for e in np.unique(ids) if e >= 0)
         n += 1
-    vram = {l: sorted(e for e, _ in freq[l].most_common(a.pinned)) for l in range(LAYERS)}
+    pinned = [a.pinned] * LAYERS
+    if a.layer_budget:
+        pinned = json.load(open(a.layer_budget))["pinned"]
+    vram = {l: sorted(e for e, _ in freq[l].most_common(pinned[l])) for l in range(LAYERS)}
     ranked = sorted(((c, l, e) for l in range(LAYERS) for e, c in freq[l].items() if e not in set(vram[l])), reverse=True)
     ram = {l: [] for l in range(LAYERS)}
     for _, l, e in ranked[:a.ram]:
         ram[l].append(e)
-    json.dump(dict(vram=vram, ram=ram), open(a.out, "w"))
+    out = dict(vram=vram, ram=ram)
+    if a.layer_budget:
+        # Per-layer slots: each layer's pinned experts plus the same --lru + 1 free slots.
+        out["capacity"] = {l: pinned[l] + a.lru + 1 for l in range(LAYERS)}
+        print(f"per-layer capacity {min(out['capacity'].values())}-{max(out['capacity'].values())}, "
+              f"total {sum(out['capacity'].values())} slots")
+    json.dump(out, open(a.out, "w"))
     per_layer = [len(ram[l]) for l in range(LAYERS)]
     print(f"{n} decode calls; RAM tier per layer min {min(per_layer)} max {max(per_layer)}; wrote {a.out}")
 
@@ -42,7 +51,8 @@ def evaluate(a):
     calls = list(decode_calls(a.test, a.max_tokens))
     for path in a.placement:
         p = json.load(open(path))
-        pinned = [set(p["vram"][str(l)][:a.pinned]) for l in range(LAYERS)]
+        cut = None if "capacity" in p else a.pinned   # per-layer placements pin their whole list
+        pinned = [set(p["vram"][str(l)][:cut]) for l in range(LAYERS)]
         ram = {(int(l), e) for l, es in p["ram"].items() for e in es}
         lru = [OrderedDict() for _ in range(LAYERS)]
         t = Counter()
@@ -67,11 +77,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     l = sub.add_parser("learn"); l.add_argument("traces", nargs="+"); l.add_argument("--out", required=True)
+    l.add_argument("--layer-budget", help="layer_budget.py --out file: per-layer pinned counts and capacities")
     e = sub.add_parser("eval"); e.add_argument("--placement", nargs="+", required=True); e.add_argument("--test", nargs="+", required=True)
     for s in (l, e):
         s.add_argument("--pinned", type=int, default=151)
         s.add_argument("--ram", type=int, default=4400 if s is l else None)
         s.add_argument("--max-tokens", type=int, default=16)
-    e.add_argument("--lru", type=int, default=56)
+    for s in (l, e):
+        s.add_argument("--lru", type=int, default=56)
     a = ap.parse_args()
     learn(a) if a.cmd == "learn" else evaluate(a)
