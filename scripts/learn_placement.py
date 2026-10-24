@@ -22,6 +22,24 @@ def decode_calls(paths, max_tokens):
                 yield layer, ids
 
 
+def post_lru_misses(paths, max_tokens, vram, lru_cap):
+    """Per (layer, expert): loads that miss both the pinned set and an LRU of lru_cap slots."""
+    pinned = [set(vram[l]) for l in range(LAYERS)]
+    lru = [OrderedDict() for _ in range(LAYERS)]
+    out = [Counter() for _ in range(LAYERS)]
+    for layer, ids in decode_calls(paths, max_tokens):
+        for e in (int(x) for x in np.unique(ids) if x >= 0):
+            if e in pinned[layer]:
+                continue
+            if e in lru[layer]:
+                lru[layer].move_to_end(e); continue
+            out[layer][e] += 1
+            lru[layer][e] = None
+            if len(lru[layer]) > lru_cap:
+                lru[layer].popitem(last=False)
+    return out
+
+
 def learn(a):
     freq = [Counter() for _ in range(LAYERS)]
     n = 0
@@ -32,7 +50,10 @@ def learn(a):
     if a.layer_budget:
         pinned = json.load(open(a.layer_budget))["pinned"]
     vram = {l: sorted(e for e, _ in freq[l].most_common(pinned[l])) for l in range(LAYERS)}
-    ranked = sorted(((c, l, e) for l in range(LAYERS) for e, c in freq[l].items() if e not in set(vram[l])), reverse=True)
+    # RAM tier: by raw frequency, or (--ram-by misses) by how often each expert would still
+    # miss after the pinned set and the LRU, replayed over the training traces.
+    rank = freq if a.ram_by == "freq" else post_lru_misses(a.traces, a.max_tokens, vram, a.lru)
+    ranked = sorted(((c, l, e) for l in range(LAYERS) for e, c in rank[l].items() if e not in set(vram[l])), reverse=True)
     ram = {l: [] for l in range(LAYERS)}
     for _, l, e in ranked[:a.ram]:
         ram[l].append(e)
@@ -77,6 +98,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     l = sub.add_parser("learn"); l.add_argument("traces", nargs="+"); l.add_argument("--out", required=True)
+    l.add_argument("--ram-by", choices=["freq", "misses"], default="freq",
+                   help="rank the RAM tier by raw frequency or by post-LRU misses")
     l.add_argument("--layer-budget", help="layer_budget.py --out file: per-layer pinned counts and capacities")
     e = sub.add_parser("eval"); e.add_argument("--placement", nargs="+", required=True); e.add_argument("--test", nargs="+", required=True)
     for s in (l, e):
