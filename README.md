@@ -59,11 +59,11 @@ placement + 4,400-expert RAM tier + 4 sequences.
 
 | | |
 |---|---|
-| Decode, code (T=0, thinking off) | 88–95 tok/s |
-| Decode, thinking mode (T=1) | 76–81 tok/s |
-| Decode, prose | 65–70 tok/s |
-| 4 concurrent requests | about 92 tok/s total, about 23 per stream, all starting within about 1 s |
-| Prefill, real source code, about 50k-token prompts | about 1,810–1,871 tok/s |
+| Decode, code (T=0, thinking off) | 94–102 tok/s |
+| Decode, thinking mode (T=1) | 84–88 tok/s |
+| Decode, prose | 69–78 tok/s |
+| 4 concurrent requests | about 97 tok/s total, about 24 per stream, all starting within about 1 s |
+| Prefill, real source code, about 50k-token prompts | about 1,900 tok/s |
 | Context | 1M tokens (2 GiB fp8 KV cache) |
 | Long-prompt recall (passphrase at 2k / 8k / 25k tokens) | exact |
 
