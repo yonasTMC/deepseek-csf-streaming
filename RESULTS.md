@@ -75,7 +75,7 @@ Not established: 150 tok/s single stream; 4k tok/s prefill.
 
 ## Split pack + deterministic kernel — 2026-10-24 (deployed)
 
-Root cause of junk tokens in greedy output: B12X's automatically selected small-batch MoE kernel is not reproducible at the TP2 slice width of 1,152 (2–3% of max between identical calls; about 5% from the deterministic kernel). Each rank's expert slice is now packed as two 576-wide half experts (`pack_experts.py --split 2`) and served through the deterministic dynamic M16 kernel with one 4,096-token plan. Masked (`-1`) routes corrupt this plan's output intermittently, so masked routes use a pinned slot with gate 0. See REVIEW.md §3 and `evidence/junk-tokens/`.
+Root cause of junk tokens in greedy output: B12X's automatically selected small-batch MoE kernel is not reproducible at the TP2 slice width of 1,152 (2–3% of max between identical calls; about 5% from the deterministic kernel). Each rank's expert slice is now packed as two 576-wide half experts (`pack_experts.py --split 2`) and served through the deterministic dynamic M16 kernel with one 4,096-token plan. Masked (`-1`) routes corrupt this plan's output intermittently, so masked routes use a pinned slot with gate 0. See [docs/DESIGN.md §4](docs/DESIGN.md) and `evidence/junk-tokens/`.
 
 | Measurement (dev server, 3,000-expert RAM tier, prefetch off) | Result |
 |---|---|
