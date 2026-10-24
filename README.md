@@ -21,11 +21,11 @@ Measured on the target machine with an idle server, single request unless noted.
 
 | | |
 |---|---|
-| Decode, code (T=0, thinking off) | 80–88 tok/s |
-| Decode, thinking mode (T=1) | 75–81 tok/s |
-| Decode, prose | 62–67 tok/s |
-| 4 concurrent requests | about 81 tok/s total (22–25 each), all starting within about 1 s |
-| Prefill, real source code, 48–52k-token prompts | about 1,800 tok/s |
+| Decode, code (T=0, thinking off) | 88–95 tok/s |
+| Decode, thinking mode (T=1) | 76–81 tok/s |
+| Decode, prose | 65–70 tok/s |
+| 4 concurrent requests | about 92 tok/s total (25–28 each), all starting within about 1 s |
+| Prefill, real source code, about 50k-token prompts | about 1,810–1,870 tok/s |
 | Context | 1M tokens (2 GiB fp8 KV holds about 1.9M) |
 | Long-prompt recall (passphrase at 2k / 8k / 25k tokens) | exact |
 
@@ -40,12 +40,12 @@ See [RESULTS.md](RESULTS.md) for every measurement and how it was taken, and [do
 ## How it works, briefly
 
 - **Tiers per layer and rank:**
-  - **VRAM:** 208 expert slots. 151 are pinned to the experts that real traffic uses most; the rest are an LRU.
+  - **VRAM:** 128–304 expert slots per layer, sized by each layer's measured miss rate. Most are pinned to the experts that real traffic uses most; the rest are an LRU.
   - **RAM:** a pinned tier of 4,400 expert records per rank, ranked by frequency across all layers.
   - **NVMe:** an expert pack, one 9.4 MB record per expert and rank, stored in B12X's prepared slot layout, so a miss is a byte copy and never a repack.
 - **Inside the CUDA graph:**
   - A `publish` kernel maps the routed expert ids to slots and posts misses to a host-mapped mailbox.
-  - `wait_fill` waits for the host's acknowledgement, then copies the records from pinned host memory into VRAM (45–48 GB/s).
+  - `wait_fill` copies each record from pinned host memory into VRAM (45–48 GB/s) as soon as the host marks it ready. RAM-tier records copy while NVMe reads are still in flight.
   - `finalize` installs the slot table.
 - **On the host:** a C++ service thread runs the slot policy and issues `O_DIRECT` reads with 12 reader threads, demand reads before read-ahead. It never calls CUDA and never takes the GIL.
 - **Expert math:** each rank's expert slice is stored as **two half-width experts** and runs through B12X's **deterministic** MoE kernel. The default small-batch kernel is not reproducible at the full TP2 width, and it put stray tokens into greedy code output.
@@ -104,6 +104,8 @@ PACK_DIRS=/pack/nvme1/split:/pack/nvme2/split PLACEMENT=placement-learned-202610
 | `scripts/logprob_eval.py` | Teacher-forced next-token distributions; compares engines position by position |
 | `scripts/decode_mix.py`, `scripts/decode_speed.py`, `scripts/concurrency.py` | Decode speed by content type and concurrency |
 | `scripts/learn_placement.py` | Learns a placement from recorded route traces, and replays held-out traces against placements |
+| `scripts/layer_budget.py` | Chooses per-layer slot counts at a fixed total by replaying held-out decode traffic |
+| `scripts/read_bench.py` | `O_DIRECT` read latency of expert records, whole versus chunked |
 | `scripts/kernel_race.py`, `scripts/decode_cfgs.py`, `scripts/split_check.py` | MoE kernel reproducibility, speed and split-layout checks |
 | `scripts/validate_gpu.py`, `scripts/validate_graph.py` | Bit-exact cache checks against the fully resident reference |
 

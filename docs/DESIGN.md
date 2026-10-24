@@ -28,8 +28,8 @@ How the engine works, why it ended up this way, what has and has not been verifi
 
 Per routed layer and rank:
 
-1. **Tiers:** 208 VRAM slots (151 pinned, 56 LRU, 1 never lent), a RAM tier of 4,400 records per rank, and the NVMe pack. Each pack record is 9,404,416 bytes, 4 KiB-aligned, one per (rank, layer, expert), so a miss is a single `O_DIRECT` read.
-2. **The mailbox:** inside the CUDA graph, `publish` maps expert ids to slots through a device table and posts the request to host-mapped memory. `wait_fill` polls with `ld.acquire.sys` and `__nanosleep`. After the host acknowledges, 24 blocks copy the records from pinned host memory with uncached loads at 45–48 GB/s. `finalize` installs the table entries.
+1. **Tiers:** VRAM slots per layer, 128–304 depending on the layer's miss rate, 8,320 in total (pinned experts plus 57 others: 56 LRU and 1 never lent); a RAM tier of 4,400 records per rank; and the NVMe pack. Each pack record is 9,404,416 bytes, 4 KiB-aligned, one per (rank, layer, expert), so a miss is a single `O_DIRECT` read.
+2. **The mailbox:** inside the CUDA graph, `publish` maps expert ids to slots through a device table and posts the request to host-mapped memory. `wait_fill` polls with `ld.acquire.sys` and `__nanosleep`. The host's acknowledgement lists every fill, with RAM-tier and ready read-ahead fills first, plus a per-fill ready flag that is set when the source bytes are in host memory. `wait_fill` copies each fill, 24 blocks with uncached loads at 45–48 GB/s, as soon as its flag is set, so RAM copies overlap with NVMe reads that are still in flight. `finalize` installs the table entries.
 3. **The host service** (`csrc/v4.cu`):
    - Reads requests and runs the slot policy (LRU, soft pinning).
    - Serves records from the RAM tier or from a read-ahead cache of 160 pinned buffers, using 12 `O_DIRECT` reader threads that serve demand misses before read-ahead.

@@ -3,9 +3,9 @@
 A chronological log of measurements on the target machine: 2× RTX PRO 6000 Blackwell (96 GB), 124 GiB of RAM, 2× Samsung 9100 PRO. Each section states its configuration. Later sections supersede earlier ones.
 
 **Current state (2026-10-24):**
-- **Configuration:** split pack, deterministic kernel, compacted prefill, learned placement, 4,400-expert RAM tier, 4 sequences.
-- **Decode:** 80–88 tok/s on code, 75–81 in thinking mode, 62–67 on prose; 4 concurrent streams total about 81 tok/s.
-- **Prefill:** about 1,800 tok/s on real 48–52k-token code prompts.
+- **Configuration:** split pack, deterministic kernel, compacted prefill, progressive fill acknowledgement, per-layer slot counts learned from traffic, 4,400-expert RAM tier, 4 sequences.
+- **Decode:** 88–95 tok/s on code, 76–77 in thinking mode, 65–70 on prose; 4 concurrent streams total about 92 tok/s.
+- **Prefill:** about 1,810 tok/s on real 50k-token code prompts.
 - **Recall:** passphrase recall exact at 2k, 8k and 25k tokens.
 
 ## v1 baseline — 2026-10-23
@@ -147,3 +147,23 @@ Production pod, 4,400-expert RAM tier, T=0 thinking off unless noted (old = dev-
 Tokens per step are unchanged; the difference is expert misses. The old placement had been learned from dev benchmark traffic, including the ISO-8601 and LRU-cache prompts that the last two rows use.
 
 The RAM tier is 4,400 per rank with a 116Gi container limit and nothing else heavy on the machine; 13 GiB of host RAM remained available after startup.
+
+## Progressive fill acknowledgement and per-layer slots — 2026-10-24
+
+Before, the host acknowledged a request only after every source of its fills was in host memory, so NVMe reads and the GPU's copies ran back to back. Now the host publishes all fill descriptors at once, with RAM-tier and ready read-ahead fills first, and a ready flag per fill; `wait_fill` copies each fill as soon as its flag is set.
+
+`scripts/layer_budget.py` replays held-out decode traffic and moves pinned slots between layers at a fixed total. Misses per decode step fell from 48.8 to 43.1 (−11.8%); the RAM-tier fills it removed outnumber the NVMe reads (32.7 → 27.3 RAM, 16.1 → 15.8 NVMe per step). The deployed placement (`evidence/placement-layered-20261024.json`) has 128–304 slots per layer, 8,320 in total, the same VRAM.
+
+Dev server, 4,400-expert RAM tier, 4 sequences, two samples per prompt:
+
+| | Baseline | + progressive ack | + per-layer slots | Production after |
+|---|---|---|---|---|
+| Code | 80–89 tok/s | 86–92 | 88–97 | 88–95 |
+| Prose | 61–66 | 64–70 | 65–70 | 65–70 |
+| Thinking (T=1) | 74–78 | 74–82 | 80–81 | 76–77 |
+| 4 streams total | 77 | 90 | 92 | 92 |
+| Prefill, real code, about 50k tokens | 1,612–1,660 | 1,794–1,828 | 1,820–1,871 | 1,810 |
+
+Greedy junk test 0/7 bad and recall exact at 2k, 8k and 25k on the final build.
+
+**Chunked NVMe reads, not adopted** (`scripts/read_bench.py`, real pack files, `O_DIRECT`): one 9.4 MB read takes 1.01 ms (9.3 GB/s). The same record as 2, 4 or 8 parallel chunks took 1.01–1.23 ms. With 4 records in flight the drive reaches about 10 GB/s, whether or not reads are chunked. Both 9100 PROs run at PCIe Gen5 x4.
