@@ -5,6 +5,10 @@ GRAPH_TOKENS = int(os.environ.get("CSF_GRAPH_TOKENS", "8"))
 BREAKABLE = os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH") == "1"
 DEBUG_MOE_CHUNK = int(os.environ.get("CSF_DEBUG_MOE_CHUNK", "0"))
 EXPERT_MAJOR = os.environ.get("CSF_V4") == "1" and os.environ.get("CSF_EXPERT_MAJOR_PREFILL", "1") == "1"
+# Prefill group 0 (every resident expert) as one dense pass instead of gathered (token, route) pairs.
+DENSE_GROUP0 = os.environ.get("CSF_PREFILL_DENSE0", "1") == "1"
+# Chunks at least this long read the next layer's previous-chunk experts ahead (0 disables).
+CROSS_LAYER_MIN_TOKENS = int(os.environ.get("CSF_PREFILL_CROSS_LAYER_MIN_TOKENS", "1024"))
 
 
 def install():
@@ -127,11 +131,26 @@ def install():
                 # reloaded the same experts many times (~330 tok/s on a 57k prompt).
                 acc = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
                 groups = self.cache.expert_groups(topk_ids)
+                cross = []
+                if CROSS_LAYER_MIN_TOKENS and x.shape[0] >= CROSS_LAYER_MIN_TOKENS:
+                    nxt = self.cache.next_layer()
+                    cross = nxt.prefill_hints() if nxt is not None else []
                 for i, group in enumerate(groups):
+                    last = i + 1 == len(groups)
                     batch = torch.tensor(group, dtype=topk_ids.dtype, device=x.device)
-                    # Make the batch resident; the host reads the next group ahead meanwhile.
-                    self.cache.graph_slots(batch.view(1, -1), ahead=groups[i + 1] if i + 1 < len(groups) else None)
+                    # Make the batch resident; the host reads the next group (or, after the
+                    # last group, the next layer's likely experts) ahead meanwhile.
+                    self.cache.graph_slots(batch.view(1, -1), ahead=None if last else groups[i + 1],
+                                           hints=cross if last else None)
                     mask = torch.isin(topk_ids, batch)
+                    if split and i == 0 and DENSE_GROUP0:
+                        # Resident group: one dense pass per 4,096 tokens; routes outside the
+                        # group ride the safe slot at gate 0 (run_slots never sends -1).
+                        slots = self.cache.slots_for(topk_ids, mask)
+                        for lo in range(0, x.shape[0], self.cache.split_max_tokens):
+                            hi = lo + self.cache.split_max_tokens
+                            acc[lo:hi] += self.cache.run_slots(x[lo:hi], topk_weights[lo:hi], slots[lo:hi]).float()
+                        continue
                     if split:
                         # Only this group's (token, route) pairs: no masked routes, no wasted rows.
                         tok, route = mask.nonzero(as_tuple=True)

@@ -36,7 +36,10 @@ BOX_IDS = 8192                      # int32 ids + predictions per layer mailbox
 BOX_WORDS = BOX_HEADER + BOX_IDS // 2
 MAX_LAYERS = 64
 SPLIT_MAX_TOKENS = int(os.environ.get("CSF_SPLIT_MAX_TOKENS", "4096"))
-SAME_LAYER_HINT = 1 << 20               # prediction ids >= this are read ahead for the same layer
+# v4 read-ahead hints (csrc/v4.cu): [HINT_BULK] | (target_layer + 1) << HINT_LAYER_SHIFT | expert.
+# Bulk (prefill) hints are uncapped whole-record reads; others are decode predictions.
+HINT_LAYER_SHIFT = 16
+HINT_BULK = 1 << 24
 DEBUG = os.environ.get("CSF_DEBUG") == "1"
 
 
@@ -52,8 +55,10 @@ def v4_ext():
             build = Path(os.environ.get("CSF_EXT_BUILD_DIR") or Path(os.environ.get("XDG_CACHE_HOME", "/tmp"))) / "csf-v4-build"
             build.mkdir(parents=True, exist_ok=True)
             _V4 = load(name="csf_v4", sources=[str(Path(__file__).parent / "csrc" / "v4.cu")],
-                       extra_cuda_cflags=["-O3"], extra_cflags=["-O3"], build_directory=str(build),
-                       verbose=False)
+                       extra_cuda_cflags=["-O3"], extra_cflags=["-O3"], extra_ldflags=["-luring"],
+                       build_directory=str(build), verbose=False)
+            if (_V4.HINT_LAYER_SHIFT, _V4.HINT_BULK) != (HINT_LAYER_SHIFT, HINT_BULK):
+                raise RuntimeError("csf_v4 hint encoding does not match fastcache.py")
         return _V4
 
 
@@ -313,7 +318,11 @@ class FastExpertCache:
         self.metrics_interval = max(1, env_int("CSF_STREAM_METRICS_INTERVAL", 50))
         self.fake_hits = os.environ.get("CSF_STREAM_FAKE_HITS") == "1"
         self.prefetch_width = 0 if self.fake_hits else env_int("CSF_PREFETCH_WIDTH", 6)
-        self.prefetch_tokens = env_int("CSF_PREFETCH_MAX_TOKENS", 4)
+        self.prefetch_tokens = env_int("CSF_PREFETCH_MAX_TOKENS", 16)
+        # Decode predictions target layer + distance: one layer ahead leaves too little time
+        # for a 1 ms NVMe read to land before that layer asks for it.
+        self.prefetch_distance = max(1, env_int("CSF_PREFETCH_DISTANCE", 1))
+        self.split_max_tokens = SPLIT_MAX_TOKENS
         self.prefill_prefetch = env_int("CSF_PREFILL_PREFETCH", 1) == 1
         self.prefill_width = env_int("CSF_PREFILL_WIDTH", 6)
         self.prefill_min_votes = env_int("CSF_PREFILL_MIN_VOTES", 1)
@@ -621,36 +630,43 @@ class FastExpertCache:
             with nxt.lock:
                 nxt.prefetch(list(dict.fromkeys(pred)))
 
-    def graph_slots(self, topk_ids, x=None, ahead=None):
+    def graph_slots(self, topk_ids, x=None, ahead=None, hints=None):
         """Graph-capturable expert -> slot translation with host miss service.
 
         `ahead` (eager v4 only): experts of this layer needed next, read into
-        host buffers while the current request is computed."""
+        host buffers while the current request is computed. `hints` (eager v4
+        only): already-encoded read-ahead hints for other layers."""
         ext = mailbox_ext()
         ids = topk_ids.reshape(-1).to(torch.int64)
         pred = self.empty_pred
-        nxt = _CACHES.get((self.rank, self.layer + 1))
         capturing = torch.cuda.is_current_stream_capturing()
         # Prefetch hints only from graph replays: eager calls stay fully
         # synchronous so no helper thread issues CUDA calls when vLLM begins
         # a (globally scoped) graph capture right after its warmup pass.
-        if ((capturing or V4) and x is not None and nxt is not None and self.prefetch_width
-                and x.shape[0] <= self.prefetch_tokens):
-            weight, bias = nxt.router()
+        decode = x is not None and x.shape[0] <= self.prefetch_tokens
+        target = _CACHES.get((self.rank, self.layer + (self.prefetch_distance if decode else 1)))
+        if (capturing or V4) and x is not None and target is not None and self.prefetch_width and decode:
+            weight, bias = target.router()
             score = torch.sqrt(torch.nn.functional.softplus(x.float() @ weight.T)) + bias
-            pred = score.topk(self.prefetch_width, dim=-1).indices.reshape(-1)
-        elif (V4 and not capturing and x is not None and nxt is not None and self.prefill_prefetch
-              and x.shape[0] > self.prefetch_tokens):
+            pred = (score.topk(self.prefetch_width, dim=-1).indices.reshape(-1)
+                    + ((target.layer + 1) << HINT_LAYER_SHIFT))
+        elif V4 and not capturing and x is not None and target is not None and self.prefill_prefetch and not decode:
             # Prefill: read ahead the union of the next layer's predicted
             # experts over all chunk tokens (eager only; variable length).
-            weight, bias = nxt.router()
+            weight, bias = target.router()
             score = torch.sqrt(torch.nn.functional.softplus(x.float() @ weight.T)) + bias
             top = score.topk(self.prefill_width, dim=-1).indices.reshape(-1)
             votes = torch.bincount(top, minlength=self.num_experts)
-            pred = (votes >= self.prefill_min_votes).nonzero().reshape(-1)
-        if V4 and ahead and not capturing:
-            hints = [e + SAME_LAYER_HINT for e in ahead if e not in self.pinned]
-            pred = torch.cat([pred, torch.tensor(hints, dtype=pred.dtype, device=pred.device)])
+            pred = ((votes >= self.prefill_min_votes).nonzero().reshape(-1)
+                    + (HINT_BULK | ((target.layer + 1) << HINT_LAYER_SHIFT)))
+        extra = []
+        if V4 and not capturing:
+            if ahead:
+                base = HINT_BULK | ((self.layer + 1) << HINT_LAYER_SHIFT)
+                extra += [base + e for e in ahead if e not in self.pinned]
+            extra += hints or []
+        if extra:
+            pred = torch.cat([pred, torch.tensor(extra, dtype=pred.dtype, device=pred.device)])
         if ids.numel() + pred.numel() > BOX_IDS:
             raise ValueError("too many routed ids for one mailbox call")
         if V4:
@@ -697,21 +713,31 @@ class FastExpertCache:
         return torch.where(topk_ids < 0, topk_ids, table.to(topk_ids.dtype))
 
     def expert_groups(self, topk_ids):
-        """Expert-major prefill: this call's distinct experts in batches that fit
-        the evictable slots, already-resident ones first so later batches cannot
-        evict them before use. Pinned experts ride along in the first batch."""
+        """Expert-major prefill: this call's distinct experts in batches.
+
+        Group 0 is every expert already resident (pinned or LRU), so it needs no
+        fill and cannot be evicted by the misses that follow; the misses come in
+        batches that fit the evictable slots. One device-to-host sync."""
         needed = torch.unique(topk_ids[topk_ids >= 0]).long()
-        resident = (self.table[needed] >= 0).tolist()
-        needed = needed.tolist()
-        # A pinned expert can be lent to a many-stream decode step (v4 soft
-        # pinning); only resident pinned experts ride along for free.
-        pinned = [e for e, r in zip(needed, resident) if r and e in self.pinned]
-        rest = [e for e, r in zip(needed, resident) if r and e not in self.pinned]
-        rest += [e for e, r in zip(needed, resident) if not r]
-        size = self.capacity - len(self.pinned) - 1
-        groups = [rest[i:i + size] for i in range(0, len(rest), size)] or [[]]
-        groups[0] = pinned + groups[0]
-        return groups
+        pairs = torch.stack([needed, self.table[needed].long()], 1).tolist()
+        self.prefill_needed = [e for e, _ in pairs]
+        resident = [e for e, s in pairs if s >= 0]
+        missing = [e for e, s in pairs if s < 0]
+        size = max(1, self.capacity - len(self.pinned) - 1)
+        groups = [missing[i:i + size] for i in range(0, len(missing), size)]
+        return [resident] + groups if resident else groups or [[]]
+
+    def next_layer(self):
+        return _CACHES.get((self.rank, self.layer + 1))
+
+    def prefill_hints(self):
+        """Bulk read-ahead hints for this layer's experts that the previous prefill
+        chunk needed: consecutive chunks of one prompt touch nearly the same set."""
+        last = getattr(self, "prefill_needed", None)
+        if not last:
+            return []
+        base = HINT_BULK | ((self.layer + 1) << HINT_LAYER_SHIFT)
+        return [base + e for e in last if e not in self.pinned]
 
     def slots_for(self, topk_ids, mask):
         """Device translation of the masked routes after a batch is resident."""

@@ -11,13 +11,28 @@
 // issues O_DIRECT reads and writes the acknowledgement. It never calls CUDA
 // and never takes the GIL, so a blocked Python thread or a driver-wide
 // operation elsewhere in the process cannot stall it.
+//
+// Reads go through one io_uring thread (fixed buffers; CSF_NO_URING=1 falls
+// back to pread threads) in three classes:
+//   demand  the GPU is waiting: always submitted first.
+//   bulk    prefill read-ahead (the next expert group / next layer): up to
+//           CSF_BULK_DEPTH records in flight alongside demand reads.
+//   spec    decode predictions: split into CSF_SPEC_CHUNKS pieces, at most
+//           CSF_SPEC_DEPTH pieces at the drive and only while no other read
+//           is in flight, so a wrong guess delays a demand read by one small
+//           chunk instead of a whole 9.4 MB record. A demand for a record that
+//           is still being read ahead promotes its queued pieces.
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
+#include <liburing.h>
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 #include <immintrin.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 
@@ -27,6 +42,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <future>
 #include <list>
 #include <map>
 #include <mutex>
@@ -39,11 +55,19 @@
 namespace {
 
 constexpr int kHeader = 8;   // box: seq ack count miss npred error fill_done reserved
-constexpr int kMaxFill = 128;
-constexpr int kSameLayerHint = 1 << 20;  // prediction ids >= this: read ahead for this layer
+constexpr int kMaxFill = 256;
+// Read-ahead hints follow the routed ids in a mailbox request:
+//   [kHintBulk] | (target_layer + 1) << kHintLayerShift | expert
+// Bulk hints (prefill) are uncapped; others are decode predictions (spec reads).
+// A bare expert id (< 1 << kHintLayerShift) means "layer + 1, spec".
+constexpr int kHintLayerShift = 16;
+constexpr int kHintBulk = 1 << 24;
+constexpr unsigned kUringEntries = 256;
+constexpr unsigned long long kWakeTag = ~0ULL;
+enum ReadClass { kDemand = 0, kBulk = 1, kSpec = 2 };
 // ack: nfill nevict | fills (expert<<32|slot, source) | evictions | per-fill ready (= seq when its
-// source bytes are in host memory). The GPU copies each fill once its flag is set, so RAM-tier
-// copies run while NVMe reads for the same request are still in flight.
+// source bytes are in host memory). Ready fills are emitted first, followed by NVMe fills in actual
+// completion order so an early read never waits behind a slower sibling on PCIe.
 constexpr int kAckReady = 2 + 3 * kMaxFill;
 constexpr int kAckWords = kAckReady + kMaxFill;
 constexpr int kMaxFields = 8;
@@ -93,8 +117,8 @@ __global__ void wait_fill_kernel(long long* dev_state, long long* box, const lon
   __shared__ int go;
   __shared__ int nfill;
   __shared__ long long seq_s, start_s;
-  __shared__ int fill_slot[kMaxFill];
-  __shared__ long long fill_src[kMaxFill];
+  __shared__ int slot_s;
+  __shared__ long long src_s;
   if (threadIdx.x == 0) {
     go = 0;
     if (dev_state[1]) {
@@ -119,21 +143,15 @@ __global__ void wait_fill_kernel(long long* dev_state, long long* box, const lon
   }
   __syncthreads();
   if (!go) return;
-  // Thread 0 alone reads the acknowledgement (system-scope loads serialize);
-  // the block barrier then orders every thread's copies after its acquire.
   if (threadIdx.x == 0) {
     nfill = static_cast<int>(ld_acquire_sys(ack + 0));
-    for (int e = 0; e < nfill; ++e) {
-      fill_slot[e] = static_cast<int>(ld_acquire_sys(ack + 2 + 2 * e) & 0xffffffffLL);
-      fill_src[e] = ld_acquire_sys(ack + 3 + 2 * e);
-    }
   }
   __syncthreads();
   const long long G = gridDim.x, b = blockIdx.x;
   for (int e = 0; e < nfill; ++e) {
     if (threadIdx.x == 0) {
-      // Wait until this fill's source bytes are in host memory (RAM-tier fills come first and
-      // are ready at once; NVMe fills become ready as their reads complete).
+      // Wait until fill slot e is published (RAM-tier fills come first; NVMe fills are written to
+      // the next slot in completion order so completed reads copy over PCIe without HoL blocking).
       unsigned long long now;
       while (ld_acquire_sys(ack + kAckReady + e) < seq_s) {
         __nanosleep(256);
@@ -147,11 +165,15 @@ __global__ void wait_fill_kernel(long long* dev_state, long long* box, const lon
           break;
         }
       }
+      if (go) {
+        slot_s = static_cast<int>(ld_acquire_sys(ack + 2 + 2 * e) & 0xffffffffLL);
+        src_s = ld_acquire_sys(ack + 3 + 2 * e);
+      }
     }
     __syncthreads();
     if (!go) return;
-    long long src = fill_src[e];
-    int slot = fill_slot[e];
+    long long src = src_s;
+    int slot = slot_s;
     for (int f = 0; f < fields.count; ++f) {
       long long bytes = fields.row_bytes[f];
       char* dst = reinterpret_cast<char*>(fields.dst[f]) + slot * bytes;
@@ -175,6 +197,7 @@ __global__ void wait_fill_kernel(long long* dev_state, long long* box, const lon
         for (long long i = threadIdx.x; i < bytes / 4; i += blockDim.x) d1[i] = ld_cv_int(s1 + i);
       }
     }
+    __syncthreads();
   }
 }
 
@@ -220,6 +243,7 @@ struct Buf {
   int state = 0;                 // 0 empty, 1 loading, 2 ready
   int pending = 0;               // reads still outstanding while loading
   bool prefetched = false;
+  bool spec = false;             // counts toward the spec read-ahead cap until loaded
   int lock_layer = -1;
   long long lock_seq = 0;
   unsigned long long last_use = 0;
@@ -229,6 +253,7 @@ struct Stats {
   long long calls = 0, hits = 0, misses = 0, miss_waits = 0;
   long long fill_ram = 0, fill_cache_ready = 0, fill_cache_waited = 0, fill_read = 0;
   long long prefetch_reads = 0, prefetch_used = 0, prefetch_skipped = 0;
+  long long bulk_reads = 0, prefetch_promoted = 0;
   long long service_ns = 0, read_wait_ns = 0;
   long long pinned_borrowed = 0;
 };
@@ -251,8 +276,8 @@ struct Layer {
   Stats st;
 };
 
-// One read into a host buffer: the whole record, or a byte range of it (chunked demand reads).
-struct Job { int buf; int fd; long long offset; bool demand; long long start = 0, len = -1; };
+// One read into a host buffer: the whole record, or a byte range of it (chunked reads).
+struct Job { int buf; int fd; long long offset; int cls; long long start = 0, len = -1; };
 
 class Service {
  public:
@@ -263,19 +288,79 @@ class Service {
   std::map<int, Layer> layers;
   std::mutex mu;                 // guards bufs/index/queues
   std::condition_variable cv, work;
-  std::deque<Job> demand_q, prefetch_q;
-  int prefetch_inflight = 0, prefetch_cap = 8;
+  std::deque<Job> queue[3];      // per ReadClass, not yet submitted
+  int dev[3] = {0, 0, 0};        // per ReadClass, submitted and not yet complete
+  int prefetch_inflight = 0, prefetch_cap = 8;   // spec records loading (CSF_PREFETCH_INFLIGHT)
   int read_chunks = 1;           // CSF_READ_CHUNKS: chunks for a request's only demand read
+  int spec_chunks = 8;           // CSF_SPEC_CHUNKS
+  int spec_depth = 2;            // CSF_SPEC_DEPTH: spec pieces at the drive at once
+  int bulk_depth = 6;            // CSF_BULK_DEPTH: bulk records at the drive at once
   unsigned long long tick = 0;
   std::atomic<bool> stop{false};
   std::atomic<long long> error_layer{-1};
   FILE* trace = nullptr;          // optional route log (simulate_cache.py format)
   long long trace_last_flush = 0;
+  bool use_uring = false;
+  bool fixed_buffers = false;
+  std::string io_mode = "pread";
+  int wake_fd = -1;
+  struct io_uring ring{};
   std::thread service;
   std::vector<std::thread> readers;
   std::string fatal;
 
   static long long key(int layer, int expert) { return static_cast<long long>(layer) * 65536 + expert; }
+
+  void notify_io() {
+    if (use_uring) {
+      uint64_t one = 1;
+      ssize_t r = write(wake_fd, &one, sizeof(one));
+      (void)r;
+    } else {
+      work.notify_all();
+    }
+  }
+
+  // Next job to submit (mu held): demand first, then bulk up to its depth, then spec pieces
+  // only while the drive has nothing else to do.
+  bool take_job(Job& job) {
+    int cls = -1;
+    if (!queue[kDemand].empty()) cls = kDemand;
+    else if (!queue[kBulk].empty() && dev[kBulk] < bulk_depth) cls = kBulk;
+    else if (!queue[kSpec].empty() && dev[kDemand] == 0 && dev[kBulk] == 0 && dev[kSpec] < spec_depth) cls = kSpec;
+    if (cls < 0) return false;
+    job = queue[cls].front();
+    queue[cls].pop_front();
+    dev[cls]++;
+    return true;
+  }
+
+  // A finished read (mu held). Returns true when its buffer became ready.
+  bool finish_job(const Job& job) {
+    dev[job.cls]--;
+    Buf& b = bufs[job.buf];
+    if (--b.pending > 0) return false;
+    b.state = 2;
+    if (b.spec) { b.spec = false; prefetch_inflight--; }
+    return true;
+  }
+
+  // Move a loading buffer's unsubmitted read-ahead pieces to the demand queue (mu held).
+  bool promote(int buf) {
+    bool moved = false;
+    for (int cls : {kBulk, kSpec}) {
+      auto& q = queue[cls];
+      for (auto it = q.begin(); it != q.end();) {
+        if (it->buf != buf) { ++it; continue; }
+        Job j = *it;
+        j.cls = kDemand;
+        queue[kDemand].push_back(j);
+        it = q.erase(it);
+        moved = true;
+      }
+    }
+    return moved;
+  }
 
   bool unlocked(const Buf& b) {
     if (b.lock_layer < 0) return true;
@@ -300,30 +385,137 @@ class Service {
     return best;
   }
 
+  // Ring setup runs on the I/O thread itself: SINGLE_ISSUER binds the ring to its creator.
+  bool uring_setup() {
+    const unsigned flag_sets[] = {IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN,
+                                  IORING_SETUP_COOP_TASKRUN, 0};
+    const char* names[] = {"defer_taskrun", "coop_taskrun", "plain"};
+    int rc = -1, which = 0;
+    for (; which < 3; ++which) {
+      struct io_uring_params p{};
+      p.flags = flag_sets[which];
+      rc = io_uring_queue_init_params(kUringEntries, &ring, &p);
+      if (rc == 0) break;
+    }
+    if (rc != 0) return false;
+    // Fixed buffers: the kernel pins the host cache once instead of on every 9.4 MB read.
+    std::vector<struct iovec> iov(bufs.size());
+    for (size_t i = 0; i < bufs.size(); ++i) {
+      iov[i].iov_base = cache_base + static_cast<long long>(i) * stride;
+      iov[i].iov_len = static_cast<size_t>(stride);
+    }
+    fixed_buffers = io_uring_register_buffers(&ring, iov.data(), static_cast<unsigned>(iov.size())) == 0;
+    io_mode = std::string("io_uring/") + names[which] + (fixed_buffers ? "/fixed" : "");
+    return true;
+  }
+
+  void uring_loop(std::promise<bool>* ready) {
+    bool ok = uring_setup();
+    ready->set_value(ok);
+    if (!ok) return;
+    struct Inflight { Job job; long long done = 0, total = 0; };
+    const unsigned max_inflight = kUringEntries - 2;   // one SQE stays free for the wake poll
+    std::vector<Inflight> slots(max_inflight);
+    std::vector<unsigned> free_ids;
+    for (unsigned i = 0; i < max_inflight; ++i) free_ids.push_back(max_inflight - 1 - i);
+    std::deque<unsigned> resubmit;
+    bool wake_armed = false;
+    auto prep = [&](struct io_uring_sqe* sqe, unsigned id) {
+      Inflight& f = slots[id];
+      char* dst = cache_base + static_cast<long long>(f.job.buf) * stride + f.job.start + f.done;
+      unsigned len = static_cast<unsigned>(f.total - f.done);
+      long long off = f.job.offset + f.job.start + f.done;
+      if (fixed_buffers) io_uring_prep_read_fixed(sqe, f.job.fd, dst, len, off, f.job.buf);
+      else io_uring_prep_read(sqe, f.job.fd, dst, len, off);
+      io_uring_sqe_set_data64(sqe, id);
+    };
+    while (!stop) {
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        while (!resubmit.empty() && io_uring_sq_space_left(&ring) > 1) {
+          prep(io_uring_get_sqe(&ring), resubmit.front());
+          resubmit.pop_front();
+        }
+        Job job;
+        while (!free_ids.empty() && io_uring_sq_space_left(&ring) > 1 && take_job(job)) {
+          unsigned id = free_ids.back();
+          free_ids.pop_back();
+          slots[id] = Inflight{job, 0, job.len < 0 ? stride : job.len};
+          prep(io_uring_get_sqe(&ring), id);
+        }
+      }
+      if (!wake_armed) {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        io_uring_prep_poll_add(sqe, wake_fd, POLLIN);
+        io_uring_sqe_set_data64(sqe, kWakeTag);
+        wake_armed = true;
+      }
+      int rc = io_uring_submit_and_wait(&ring, 1);
+      if (rc < 0 && rc != -EINTR && rc != -EAGAIN && rc != -EBUSY) {
+        std::lock_guard<std::mutex> lock(mu);
+        fatal = std::string("io_uring_submit_and_wait: ") + strerror(-rc);
+        cv.notify_all();
+        return;
+      }
+      struct io_uring_cqe* cqe = nullptr;
+      unsigned head = 0, reaped = 0;
+      bool any_ready = false;
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        io_uring_for_each_cqe(&ring, head, cqe) {
+          ++reaped;
+          unsigned long long tag = io_uring_cqe_get_data64(cqe);
+          if (tag == kWakeTag) {
+            wake_armed = false;
+            uint64_t drain = 0;
+            while (read(wake_fd, &drain, sizeof(drain)) > 0) {}
+            continue;
+          }
+          unsigned id = static_cast<unsigned>(tag);
+          Inflight& f = slots[id];
+          int res = cqe->res;
+          if (res == -EAGAIN || res == -EINTR) { resubmit.push_back(id); continue; }
+          if (res <= 0) {
+            fatal = std::string("pack read failed: ") + (res < 0 ? strerror(-res) : "end of file");
+            finish_job(f.job);
+            any_ready = true;
+            free_ids.push_back(id);
+            continue;
+          }
+          f.done += res;
+          if (f.done < f.total) { resubmit.push_back(id); continue; }
+          any_ready |= finish_job(f.job);
+          free_ids.push_back(id);
+        }
+        io_uring_cq_advance(&ring, reaped);
+      }
+      if (any_ready) cv.notify_all();
+    }
+  }
+
   void reader_loop() {
     while (true) {
       Job job;
       {
         std::unique_lock<std::mutex> lock(mu);
-        work.wait(lock, [&] { return stop || !demand_q.empty() || !prefetch_q.empty(); });
+        work.wait(lock, [&] { return stop || take_job(job); });
         if (stop) return;
-        if (!demand_q.empty()) { job = demand_q.front(); demand_q.pop_front(); }
-        else { job = prefetch_q.front(); prefetch_q.pop_front(); }
       }
       char* dst = cache_base + static_cast<long long>(job.buf) * stride + job.start;
       const long long len = job.len < 0 ? stride : job.len;
       long long done = 0;
       while (done < len) {
         ssize_t r = pread(job.fd, dst + done, len - done, job.offset + job.start + done);
+        if (r < 0 && (errno == EINTR || errno == EAGAIN)) continue;
         if (r <= 0) { std::lock_guard<std::mutex> l(mu); fatal = "pack read failed"; break; }
         done += r;
       }
       {
         std::lock_guard<std::mutex> lock(mu);
-        if (--bufs[job.buf].pending <= 0) bufs[job.buf].state = 2;
-        if (!job.demand) prefetch_inflight--;
+        finish_job(job);
       }
       cv.notify_all();
+      work.notify_all();   // a finished read can unblock queued bulk/spec reads
     }
   }
 
@@ -401,6 +593,7 @@ class Service {
       sources.resize(fills.size(), 0);
       std::vector<int> used, buf_of(fills.size(), -1);
       std::vector<Job> demand_jobs;
+      bool promoted = false;
       {
         std::unique_lock<std::mutex> lock(mu);
         tick++;
@@ -412,14 +605,20 @@ class Service {
           if (it != index.end()) {
             b = it->second;
             if (bufs[b].prefetched) { L.st.prefetch_used++; bufs[b].prefetched = false; }
-            if (bufs[b].state == 2) L.st.fill_cache_ready++; else L.st.fill_cache_waited++;
+            if (bufs[b].state == 2) {
+              L.st.fill_cache_ready++;
+            } else {
+              L.st.fill_cache_waited++;
+              // Still being read ahead: its unsubmitted pieces jump the queue.
+              if (promote(b)) { L.st.prefetch_promoted++; promoted = true; }
+            }
           } else {
             b = victim();
             while (b < 0) { cv.wait_for(lock, std::chrono::microseconds(50)); b = victim(); }
             bufs[b].layer = L.id; bufs[b].expert = e; bufs[b].state = 1;
             index[key(L.id, e)] = b;
             bufs[b].pending = 1;
-            demand_jobs.push_back(Job{b, L.fd, static_cast<long long>(e) * stride, true});
+            demand_jobs.push_back(Job{b, L.fd, static_cast<long long>(e) * stride, kDemand});
             L.st.fill_read++;
           }
           bufs[b].last_use = tick;
@@ -442,70 +641,104 @@ class Service {
             demand_jobs.push_back(part);
           }
         }
-        for (const Job& j : demand_jobs) demand_q.push_back(j);
-        if (!demand_jobs.empty()) work.notify_all();
-        // Ready fills first: the GPU copies them while the remaining reads are in flight.
-        std::vector<size_t> order(fills.size());
-        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-        std::stable_partition(order.begin(), order.end(),
-                              [&](size_t i) { return buf_of[i] < 0 || bufs[buf_of[i]].state == 2; });
+        for (const Job& j : demand_jobs) queue[kDemand].push_back(j);
+        if (!demand_jobs.empty() || promoted) notify_io();
+        // Ready fills first (RAM tier + already-loaded cache buffers); NVMe fills follow in the
+        // exact order their reads complete so a fast read never waits behind a slower one.
+        std::vector<size_t> ready_now, waiting;
+        ready_now.reserve(fills.size());
+        waiting.reserve(fills.size());
+        for (size_t i = 0; i < fills.size(); ++i) {
+          int b = buf_of[i];
+          if (b < 0 || bufs[b].state == 2) ready_now.push_back(i);
+          else waiting.push_back(i);
+        }
         vstore(ack + 0, static_cast<long long>(fills.size()));
         vstore(ack + 1, static_cast<long long>(evicted.size()));
-        for (size_t k = 0; k < order.size(); ++k) {
-          size_t i = order[k];
-          vstore(ack + 2 + 2 * k, (static_cast<long long>(fills[i].first) << 32) | fills[i].second);
-          vstore(ack + 3 + 2 * k, sources[i]);
-        }
         for (size_t i = 0; i < evicted.size(); ++i) vstore(ack + 2 + 2 * kMaxFill + i, evicted[i]);
         size_t k = 0;
-        for (; k < order.size(); ++k) {
-          int b = buf_of[order[k]];
-          if (b >= 0 && bufs[b].state != 2) break;
+        for (size_t i : ready_now) {
+          vstore(ack + 2 + 2 * k, (static_cast<long long>(fills[i].first) << 32) | fills[i].second);
+          vstore(ack + 3 + 2 * k, sources[i]);
           vstore(ack + kAckReady + k, seq);
+          ++k;
         }
         std::atomic_thread_fence(std::memory_order_release);
         vstore(box + 1, seq);
-        long long w0 = now_ns();
-        for (; k < order.size(); ++k) {
-          int b = buf_of[order[k]];
-          cv.wait(lock, [&] { return bufs[b].state == 2 || !fatal.empty(); });
-          std::atomic_thread_fence(std::memory_order_release);
-          vstore(ack + kAckReady + k, seq);
+        if (!waiting.empty()) {
+          long long w0 = now_ns();
+          while (!waiting.empty()) {
+            size_t pos = waiting.size();
+            for (size_t j = 0; j < waiting.size(); ++j) {
+              if (bufs[buf_of[waiting[j]]].state == 2) { pos = j; break; }
+            }
+            if (pos == waiting.size()) {
+              if (!fatal.empty()) break;
+              cv.wait(lock);
+              continue;
+            }
+            size_t i = waiting[pos];
+            waiting[pos] = waiting.back();
+            waiting.pop_back();
+            vstore(ack + 2 + 2 * k, (static_cast<long long>(fills[i].first) << 32) | fills[i].second);
+            vstore(ack + 3 + 2 * k, sources[i]);
+            std::atomic_thread_fence(std::memory_order_release);
+            vstore(ack + kAckReady + k, seq);
+            ++k;
+          }
+          L.st.read_wait_ns += now_ns() - w0;
         }
-        L.st.read_wait_ns += now_ns() - w0;
       }
     } else {
       L.st.hits += requested.size();
     }
-    // Read-ahead into host RAM: the next layer's predicted experts (capped), and
-    // this layer's experts that expert-major prefill needs next (uncapped).
-    std::vector<int> pred_next, pred_same;
-    for (int e : pred) (e >= kSameLayerHint ? pred_same : pred_next).push_back(e - (e >= kSameLayerHint ? kSameLayerHint : 0));
-    if (!pred_same.empty()) read_ahead(L, pred_same, false);
-    auto nxt = layers.find(L.id + 1);
-    if (!pred_next.empty() && nxt != layers.end()) read_ahead(nxt->second, pred_next, true);
+    // Read-ahead into host RAM, grouped by target layer and class (see kHintBulk).
+    std::map<std::pair<int, bool>, std::vector<int>> hints;
+    for (int raw : pred) {
+      if (raw < 0) continue;
+      const bool bulk = (raw & kHintBulk) != 0;
+      const int code = raw & (kHintBulk - 1);
+      const int target = code >> kHintLayerShift ? (code >> kHintLayerShift) - 1 : L.id + 1;
+      hints[{target, bulk}].push_back(code & ((1 << kHintLayerShift) - 1));
+    }
+    for (auto& kv : hints) {
+      auto it = layers.find(kv.first.first);
+      if (it != layers.end()) read_ahead(it->second, kv.second, kv.first.second);
+    }
     L.st.service_ns += now_ns() - t0;
   }
 
-  void read_ahead(Layer& N, const std::vector<int>& experts, bool capped) {
+  void read_ahead(Layer& N, const std::vector<int>& experts, bool bulk) {
+    bool added = false;
     {
       std::lock_guard<std::mutex> lock(mu);
       for (int e : experts) {
         if (e < 0 || e >= N.num_experts || N.slot_of[e] >= 0 || N.ram_ptr[e]) continue;
         if (index.count(key(N.id, e))) continue;
-        if (capped && prefetch_inflight >= prefetch_cap) { N.st.prefetch_skipped++; continue; }
+        if (!bulk && prefetch_inflight >= prefetch_cap) { N.st.prefetch_skipped++; continue; }
         int b = victim();
         if (b < 0) { N.st.prefetch_skipped++; break; }
-        bufs[b].layer = N.id; bufs[b].expert = e; bufs[b].state = 1; bufs[b].prefetched = true;
-        bufs[b].last_use = ++tick;
+        Buf& B = bufs[b];
+        B.layer = N.id; B.expert = e; B.state = 1; B.prefetched = true;
+        B.last_use = ++tick;
         index[key(N.id, e)] = b;
-        bufs[b].pending = 1;
-        prefetch_q.push_back(Job{b, N.fd, static_cast<long long>(e) * stride, false});
-        prefetch_inflight++;
-        N.st.prefetch_reads++;
-        work.notify_one();
+        const long long base = static_cast<long long>(e) * stride;
+        if (bulk) {
+          B.pending = 1;
+          queue[kBulk].push_back(Job{b, N.fd, base, kBulk});
+          N.st.bulk_reads++;
+        } else {
+          B.spec = true;
+          prefetch_inflight++;
+          B.pending = spec_chunks;
+          const long long piece = stride / spec_chunks;
+          for (int c = 0; c < spec_chunks; ++c) queue[kSpec].push_back(Job{b, N.fd, base, kSpec, c * piece, piece});
+          N.st.prefetch_reads++;
+        }
+        added = true;
       }
     }
+    if (added) notify_io();
   }
 
   void service_loop() {
@@ -575,7 +808,32 @@ void init(int64_t cache_ptr, int64_t cache_buffers, int64_t stride, int64_t read
   // Each chunk must stay 4 KiB aligned for O_DIRECT.
   TORCH_CHECK((stride / 4096) % g->read_chunks == 0 && stride % 4096 == 0,
               "CSF_READ_CHUNKS must split the record into 4 KiB-aligned pieces");
-  for (int i = 0; i < readers; ++i) g->readers.emplace_back([] { g->reader_loop(); });
+  auto env = [](const char* name, int fallback) {
+    const char* v = std::getenv(name);
+    return v && *v ? std::atoi(v) : fallback;
+  };
+  g->spec_chunks = std::max(1, env("CSF_SPEC_CHUNKS", 8));
+  g->spec_depth = std::max(1, env("CSF_SPEC_DEPTH", 2));
+  g->bulk_depth = std::max(1, env("CSF_BULK_DEPTH", 6));
+  if ((stride / 4096) % g->spec_chunks != 0) g->spec_chunks = 1;   // pieces must stay 4 KiB aligned
+  if (env("CSF_NO_URING", 0) == 0 && (g->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) >= 0) {
+    std::promise<bool> ready;
+    auto ok = ready.get_future();
+    std::thread io([&ready] { g->uring_loop(&ready); });
+    if (ok.get()) {
+      g->use_uring = true;
+      g->readers.push_back(std::move(io));
+    } else {
+      io.join();
+      close(g->wake_fd);
+      g->wake_fd = -1;
+    }
+  }
+  if (!g->use_uring)
+    for (int i = 0; i < readers; ++i) g->readers.emplace_back([] { g->reader_loop(); });
+  fprintf(stderr, "[csf-v4] reads: %s, spec %dx%lld B depth %d, bulk depth %d\n", g->io_mode.c_str(),
+          g->spec_chunks, static_cast<long long>(stride / g->spec_chunks), g->spec_depth, g->bulk_depth);
+  fflush(stderr);
 }
 
 void register_layer(int64_t layer, int64_t box_ptr, int64_t ack_ptr, int64_t num_experts, int64_t capacity,
@@ -632,6 +890,8 @@ std::vector<int64_t> resident(int64_t layer) {   // flat [expert, slot, ...]; de
   return out;
 }
 
+std::string io_mode() { return g ? g->io_mode : std::string(); }
+
 std::map<std::string, int64_t> stats(int64_t layer) {
   auto& s = g->layers.at(static_cast<int>(layer)).st;
   return {{"calls", s.calls}, {"hits", s.hits}, {"misses", s.misses}, {"miss_waits", s.miss_waits},
@@ -639,12 +899,15 @@ std::map<std::string, int64_t> stats(int64_t layer) {
           {"fill_cache_waited", s.fill_cache_waited}, {"fill_read", s.fill_read},
           {"prefetch_reads", s.prefetch_reads}, {"prefetch_used", s.prefetch_used},
           {"prefetch_skipped", s.prefetch_skipped}, {"service_ns", s.service_ns},
-          {"read_wait_ns", s.read_wait_ns}, {"pinned_borrowed", s.pinned_borrowed}};
+          {"read_wait_ns", s.read_wait_ns}, {"pinned_borrowed", s.pinned_borrowed},
+          {"bulk_reads", s.bulk_reads}, {"prefetch_promoted", s.prefetch_promoted}};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("ACK_WORDS") = kAckWords;
   m.attr("MAX_FILL") = kMaxFill;
+  m.attr("HINT_LAYER_SHIFT") = kHintLayerShift;
+  m.attr("HINT_BULK") = kHintBulk;
   m.def("wait_fill", &wait_fill);
   m.def("finalize", &finalize);
   m.def("init", &init);
@@ -653,4 +916,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("trace_to", &trace_to);
   m.def("resident", &resident);
   m.def("stats", &stats);
+  m.def("io_mode", &io_mode);
 }

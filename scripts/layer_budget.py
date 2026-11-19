@@ -23,29 +23,35 @@ def calls(paths, max_tokens):
     return per
 
 
-def misses(seq, ranked, pinned, lru_cap):
-    pin = set(ranked[:pinned]); lru = OrderedDict(); m = 0
+def post_lru(seq, ranked, pinned, lru_cap):
+    pin = set(ranked[:pinned]); lru = OrderedDict(); c = Counter()
     for ids in seq:
         for e in ids.tolist():
             if e in pin:
                 continue
-            if e in lru:
+            if lru_cap > 0 and e in lru:
                 lru.move_to_end(e); continue
-            m += 1; lru[e] = None
-            if len(lru) > lru_cap:
-                lru.popitem(last=False)
-    return m
+            c[e] += 1
+            if lru_cap > 0:
+                lru[e] = None
+                if len(lru) > lru_cap:
+                    lru.popitem(last=False)
+    return sorted(c.values(), reverse=True)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train", nargs="+", required=True)
     ap.add_argument("--test", nargs="+", required=True)
-    ap.add_argument("--lru", type=int, default=56)
-    ap.add_argument("--base", type=int, default=151)
-    ap.add_argument("--step", type=int, default=16)
-    ap.add_argument("--min", type=int, default=71)
-    ap.add_argument("--max", type=int, default=311)
+    ap.add_argument("--lru", type=int, default=28)
+    ap.add_argument("--base", type=int, default=179)
+    ap.add_argument("--step", type=int, default=8)
+    ap.add_argument("--min", type=int, default=123)
+    ap.add_argument("--max", type=int, default=347)
+    ap.add_argument("--ram", type=int, default=4600,
+                    help="RAM tier experts for cost-weighted NVMe/RAM optimization (0 = unweighted misses)")
+    ap.add_argument("--nvme-weight", type=float, default=5.0,
+                    help="cost of an NVMe miss relative to a RAM-tier miss")
     ap.add_argument("--max-tokens", type=int, default=16)
     ap.add_argument("--out")
     a = ap.parse_args()
@@ -55,28 +61,55 @@ def main():
         f = Counter()
         for ids in train[l]:
             f.update(ids.tolist())
-        ranked.append([e for e, _ in f.most_common()])
+        ranked.append([e for e, _ in f.most_common()] + [e for e in range(384) if e not in f])
     grid = list(range(a.min, a.max + 1, a.step))
     assert a.base in grid, "base must lie on the grid"
-    table = [{p: misses(test[l], ranked[l], p, a.lru) for p in grid} for l in range(LAYERS)]
+    hists = [{p: post_lru(test[l], ranked[l], p, a.lru) for p in grid} for l in range(LAYERS)]
+
+    def breakdown(al):
+        merged = []
+        for l in range(LAYERS):
+            merged.extend(hists[l][al[l]])
+        merged.sort(reverse=True)
+        ram_m = sum(merged[:a.ram]) if a.ram > 0 else 0
+        nvme_m = sum(merged[a.ram:]) if a.ram > 0 else sum(merged)
+        cost = (ram_m + a.nvme_weight * nvme_m) if a.ram > 0 else float(nvme_m)
+        return cost, ram_m, nvme_m
+
     alloc = [a.base] * LAYERS
-    total = lambda al: sum(table[l][al[l]] for l in range(LAYERS))
-    before = total(alloc)
+    before_cost, before_ram, before_nvme = breakdown(alloc)
     while True:
-        gains = [(table[l][alloc[l]] - table[l][alloc[l] + a.step], l) for l in range(LAYERS) if alloc[l] + a.step <= a.max]
-        losses = [(table[l][alloc[l] - a.step] - table[l][alloc[l]], l) for l in range(LAYERS) if alloc[l] - a.step >= a.min]
-        g, gl = max(gains); c, cl = min(x for x in losses if x[1] != gl)
-        if g <= c:
+        cur_cost, _, _ = breakdown(alloc)
+        best_cost, best_pair = cur_cost, None
+        plus = [l for l in range(LAYERS) if alloc[l] + a.step <= a.max]
+        minus = [l for l in range(LAYERS) if alloc[l] - a.step >= a.min]
+        for gl in plus:
+            alloc[gl] += a.step
+            for cl in minus:
+                if cl == gl:
+                    continue
+                alloc[cl] -= a.step
+                c, _, _ = breakdown(alloc)
+                if c < best_cost:
+                    best_cost, best_pair = c, (gl, cl)
+                alloc[cl] += a.step
+            alloc[gl] -= a.step
+        if best_pair is None:
             break
-        alloc[gl] += a.step; alloc[cl] -= a.step
-    after = total(alloc)
-    steps = len(test[0])
-    print(f"held-out decode calls per layer: {steps}; misses at {a.base} pinned everywhere: {before} ({before/steps:.2f}/step); "
-          f"per-layer allocation: {after} ({after/steps:.2f}/step), {100*(before-after)/before:.1f}% fewer")
+        alloc[best_pair[0]] += a.step
+        alloc[best_pair[1]] -= a.step
+    after_cost, after_ram, after_nvme = breakdown(alloc)
+    steps = max(len(test[0]), 1)
+    before = before_ram + before_nvme
+    after = after_ram + after_nvme
+    print(f"held-out decode calls per layer: {steps}; base={a.base} lru={a.lru} ram={a.ram} w={a.nvme_weight}: "
+          f"before ram={before_ram/steps:.2f} nvme={before_nvme/steps:.2f}/step (cost {before_cost/steps:.2f}) -> "
+          f"after ram={after_ram/steps:.2f} nvme={after_nvme/steps:.2f}/step (cost {after_cost/steps:.2f}, "
+          f"{100*(before_cost-after_cost)/max(before_cost,1):.1f}% lower)")
     print("pinned per layer:", alloc)
-    print("misses/call at base by layer:", [round(table[l][a.base] / max(len(test[l]), 1), 2) for l in range(LAYERS)])
     if a.out:
-        json.dump(dict(pinned=alloc, lru=a.lru, before=before, after=after), open(a.out, "w"))
+        json.dump(dict(pinned=alloc, lru=a.lru, ram=a.ram, nvme_weight=a.nvme_weight,
+                       before=before, after=after, before_nvme=before_nvme, after_nvme=after_nvme), open(a.out, "w"))
 
 
 if __name__ == "__main__":

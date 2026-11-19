@@ -47,22 +47,25 @@ def learn(a):
         freq[layer].update(int(e) for e in np.unique(ids) if e >= 0)
         n += 1
     pinned = [a.pinned] * LAYERS
+    lru_cap = a.lru
     if a.layer_budget:
-        pinned = json.load(open(a.layer_budget))["pinned"]
+        lb = json.load(open(a.layer_budget))
+        pinned = lb["pinned"]
+        lru_cap = lb.get("lru", a.lru)
     vram = {l: sorted(e for e, _ in freq[l].most_common(pinned[l])) for l in range(LAYERS)}
     # RAM tier: by raw frequency, or (--ram-by misses) by how often each expert would still
     # miss after the pinned set and the LRU, replayed over the training traces.
-    rank = freq if a.ram_by == "freq" else post_lru_misses(a.traces, a.max_tokens, vram, a.lru)
+    rank = freq if a.ram_by == "freq" else post_lru_misses(a.traces, a.max_tokens, vram, lru_cap)
     ranked = sorted(((c, l, e) for l in range(LAYERS) for e, c in rank[l].items() if e not in set(vram[l])), reverse=True)
     ram = {l: [] for l in range(LAYERS)}
     for _, l, e in ranked[:a.ram]:
         ram[l].append(e)
-    out = dict(vram=vram, ram=ram)
+    out = dict(vram=vram, ram=ram, lru=lru_cap)
     if a.layer_budget:
-        # Per-layer slots: each layer's pinned experts plus the same --lru + 1 free slots.
-        out["capacity"] = {l: pinned[l] + a.lru + 1 for l in range(LAYERS)}
+        # Per-layer slots: each layer's pinned experts plus the same lru_cap + 1 free slots.
+        out["capacity"] = {l: pinned[l] + lru_cap + 1 for l in range(LAYERS)}
         print(f"per-layer capacity {min(out['capacity'].values())}-{max(out['capacity'].values())}, "
-              f"total {sum(out['capacity'].values())} slots")
+              f"total {sum(out['capacity'].values())} slots (lru={lru_cap})")
     json.dump(out, open(a.out, "w"))
     per_layer = [len(ram[l]) for l in range(LAYERS)]
     print(f"{n} decode calls; RAM tier per layer min {min(per_layer)} max {max(per_layer)}; wrote {a.out}")
@@ -73,8 +76,14 @@ def evaluate(a):
     for path in a.placement:
         p = json.load(open(path))
         cut = None if "capacity" in p else a.pinned   # per-layer placements pin their whole list
+        lru_cap = p.get("lru", a.lru)
         pinned = [set(p["vram"][str(l)][:cut]) for l in range(LAYERS)]
-        ram = {(int(l), e) for l, es in p["ram"].items() for e in es}
+        ram_lists = p["ram"]
+        if a.ram:
+            flat = [(int(l), e) for l, es in ram_lists.items() for e in es][:a.ram]
+            ram = set(flat)
+        else:
+            ram = {(int(l), e) for l, es in ram_lists.items() for e in es}
         lru = [OrderedDict() for _ in range(LAYERS)]
         t = Counter()
         for layer, ids in calls:
@@ -82,16 +91,17 @@ def evaluate(a):
                 t["routes"] += 1
                 if e in pinned[layer]:
                     t["pinned"] += 1; continue
-                if e in lru[layer]:
+                if lru_cap > 0 and e in lru[layer]:
                     lru[layer].move_to_end(e); t["lru"] += 1; continue
                 t["ram" if (layer, e) in ram else "nvme"] += 1
-                lru[layer][e] = None
-                if len(lru[layer]) > a.lru:
-                    lru[layer].popitem(last=False)
+                if lru_cap > 0:
+                    lru[layer][e] = None
+                    if len(lru[layer]) > lru_cap:
+                        lru[layer].popitem(last=False)
         steps = len(calls) / LAYERS
         r = t["routes"]
-        print(f"{path}: {r} expert loads over {steps:.0f} steps | pinned {100*t['pinned']/r:.1f}%  lru {100*t['lru']/r:.1f}%  "
-              f"ram {100*t['ram']/r:.1f}%  nvme {100*t['nvme']/r:.1f}% | per step: ram {t['ram']/steps:.1f}  nvme {t['nvme']/steps:.1f}")
+        print(f"{path} (lru={lru_cap}): {r} expert loads over {steps:.0f} steps | pinned {100*t['pinned']/r:.1f}%  lru {100*t['lru']/r:.1f}%  "
+              f"ram {100*t['ram']/r:.1f}%  nvme {100*t['nvme']/r:.1f}% | per step: ram {t['ram']/steps:.2f}  nvme {t['nvme']/steps:.2f}")
 
 
 if __name__ == "__main__":

@@ -32,12 +32,13 @@ Per routed layer and rank:
 2. **The mailbox:** inside the CUDA graph, `publish` maps expert ids to slots through a device table and posts the request to host-mapped memory. `wait_fill` polls with `ld.acquire.sys` and `__nanosleep`. The host's acknowledgement lists every fill, with RAM-tier and ready read-ahead fills first, plus a per-fill ready flag that is set when the source bytes are in host memory. `wait_fill` copies each fill, 24 blocks with uncached loads at 45–48 GB/s, as soon as its flag is set, so RAM copies overlap with NVMe reads that are still in flight. `finalize` installs the table entries.
 3. **The host service** (`csrc/v4.cu`):
    - Reads requests and runs the slot policy (LRU, soft pinning).
-   - Serves records from the RAM tier or from a read-ahead cache of 160 pinned buffers, using 12 `O_DIRECT` reader threads that serve demand misses before read-ahead.
+   - Serves records from the RAM tier or from a read-ahead cache of 160 pinned buffers. `O_DIRECT` reads go through one `io_uring` thread with the cache registered as fixed buffers (`CSF_NO_URING=1` falls back to 12 `pread` threads), in three classes: demand reads first; prefill read-ahead ("bulk", up to `CSF_BULK_DEPTH` records in flight); and decode predictions ("spec"), split into `CSF_SPEC_CHUNKS` pieces that reach the drive only while nothing else is in flight, so a wrong guess delays a demand read by one small piece. A demand for a record still being read ahead promotes its queued pieces.
+   - Publishes each NVMe fill's ready flag in the order its read completes, so the GPU copies a finished record without waiting behind a slower one.
    - Writes the acknowledgement.
 
    It never calls CUDA and never takes the GIL. If the GPU waits longer than `CSF_WAIT_TIMEOUT_S` (60 s), the kernel flags an error and returns, and the service exits the process so that a supervisor restarts it.
 4. **Speculative decoding:** DSpark with 3 draft tokens and adaptive verification. CUDA graphs cover 1–16 tokens, which is up to 4 sequences of 4 tokens.
-5. **Prefill (expert-major):** for each chunk of up to 4,096 tokens, the distinct experts load at most once per layer, in groups of up to 56 non-resident experts, so up to 5 groups per layer. Each group runs only its own (token, route) pairs (`run_pairs`) and accumulates in fp32. Its `publish` names the next group's experts, which the host reads ahead (prediction ids at or above 2^20 mean "this layer").
+5. **Prefill (expert-major):** for each chunk of up to 4,096 tokens, the distinct experts load at most once per layer, in groups of up to 56 non-resident experts, so up to 5 groups per layer. Each group runs only its own (token, route) pairs (`run_pairs`) and accumulates in fp32. Group 0 is every already-resident expert and runs as one dense pass; the misses follow in groups. Each `publish` names the next group's experts, and the last group names the next layer's experts from the previous chunk, which the host reads ahead. Hints are encoded as `[1<<24 bulk] | (target_layer + 1) << 16 | expert`.
 
 ## 4. The junk-token bug and the split pack
 

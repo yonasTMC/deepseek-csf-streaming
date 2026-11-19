@@ -196,3 +196,28 @@ Greedy junk test 0/6 bad and recall exact at 2k, 8k and 25k with the shared-expe
 **Rejected after an offline test:** prefetching later layers' NVMe-class experts from co-occurrence with layers 0–1 of the same step (`scripts/cooccur_eval.py`). At 19% recall the precision is 17%; at 41% precision the recall is 1%.
 
 **Hardware note:** the test machine has 2 of its 8 DDR5 slots populated (2 × 64 GiB, 5600 MT/s), so host memory bandwidth, about 90 GB/s in theory, is shared by both GPUs' fills (about 46 GB/s each) and the NVMe writes. All 8 channels would give about 4× the bandwidth, and 512 GiB would hold every routed expert of both ranks (about 289 GB). That has not been measured.
+
+## io_uring engine, November placement, DSpark d4 — 2026-11-18 (deployed)
+
+Engine (`csrc/v4.cu`): one `io_uring` reader (defer-taskrun, host cache registered as fixed buffers; `CSF_NO_URING=1` falls back to `pread` threads) with three read classes: demand; bulk prefill read-ahead (`CSF_BULK_DEPTH`=6 records); decode predictions split into 8 × 1.18 MB pieces that reach the drive only while nothing else is in flight (`CSF_SPEC_CHUNKS`, `CSF_SPEC_DEPTH`). A demand for a record still being read ahead promotes its queued pieces. NVMe fills are acknowledged in completion order. Read-ahead hints are `[1<<24 bulk] | (target_layer + 1) << 16 | expert` (the earlier draft encoding confused layer 15 with "same layer"). Prefill: group 0 (all resident experts) runs as one dense pass, and the last group of each layer reads ahead the next layer's experts from the previous chunk. `scripts/v4_host_check.py` drives the host service without a GPU (fake packs and mailboxes, byte-checked fills); it passes in both I/O modes.
+
+Placement (`evidence/placement-layered-cost-lru56-20261118.json`, log `evidence/placement-20261118.log`): learned from the Oct 24–Nov 16 production traces, every third 400k-call block; held out the newest 15% of the Nov 3–18 trace. `layer_budget.py` now weights an NVMe miss 5× a RAM miss.
+
+| Held-out replay (69,963 decode steps) | RAM loads/step | NVMe loads/step |
+|---|---|---|
+| Oct 24 placement, lru 56, RAM 4,400 | 25.74 | 10.58 |
+| Nov placement, lru 56, RAM 4,600 (deployed) | 24.52 | 7.91 |
+| Nov placement, lru 28, RAM 4,600 | 28.85 | 6.14 |
+
+Idle production pod, same benchmark script for every row (decode 256 tokens greedy unless noted; 4 streams; real-code prefill):
+
+| Config | Code tok/s | Prose tok/s | Thinking (T=1) | 4 streams total | Prefill 48–51k |
+|---|---|---|---|---|---|
+| Before: v4-13fd825, Oct placement, d3 | 92–101 | 69–75 | 74–78 | 93.9 | 1,782 |
+| A: new engine | 88–101 | 67–76 | 86–87 | 102.1 | 1,865–1,890 |
+| A + decode prefetch width 6, distance 1 | 87–97 | 69–80 | 78–90 | 94.1 | — |
+| B: A + Nov placement lru 28, RAM 4,600 | 95–102 | 54–64 | 75–82 | 106.1 | 2,229–2,253 |
+| C: B + DSpark d4 | 85–108 | 56–59 | 79–81 | 105.0 | 2,230–2,255 |
+| D: C with the lru 56 Nov placement (deployed) | 94–105 | 62–74 | 80–81 | 107.9 | 1,971–1,997 |
+
+Deployed D: recall exact at 2k/8k/25k; greedy junk test 0/8 bad blocks (11,277 tokens at ~97 tok/s). Defaults now `thinking=false`, T=0 (LiL profile override); requests still choose per call. `/runtime` moved to the otherwise idle nvme1n1; route tracing is opt-in (`CSF_ENABLE_TRACE=1`). Decode prefetch stays off: with the new read classes it no longer slows single-stream decode, but it did not speed it up either. The lru 28 placement gives the best production replay and prefill but cost ~20% on prose.

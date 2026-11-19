@@ -1,0 +1,10 @@
+/traffic/routes-20261024-233441.bin 33804461 records
+/traffic/routes-20261103-055308.bin 50913155 records
+{'train': 25880642, 'test': 2800000}
+held-out decode calls per layer: 69984; base=179 lru=28 ram=4600 w=5.0: before ram=33.75 nvme=5.20/step (cost 59.75) -> after ram=29.64 nvme=5.34/step (cost 56.34, 5.7% lower)
+pinned per layer: [259, 227, 195, 211, 203, 187, 155, 179, 171, 171, 179, 171, 187, 219, 155, 195, 155, 187, 179, 227, 171, 155, 163, 211, 123, 131, 123, 171, 139, 163, 147, 155, 195, 171, 147, 171, 179, 211, 211, 211]
+per-layer capacity 152-288, total 8320 slots (lru=28)
+25838165 decode calls; RAM tier per layer min 65 max 157; wrote /out/placement-layered-cost-20261118.json
+/placement/placement-layered-miss-20261024.json (lru=56): 48251966 expert loads over 69963 steps | pinned 76.7%  lru 18.1%  ram 3.7%  nvme 1.5% | per step: ram 25.74  nvme 10.58
+/out/placement-layered-cost-20261118.json (lru=28): 48251966 expert loads over 69963 steps | pinned 85.7%  lru 9.2%  ram 4.2%  nvme 0.9% | per step: ram 28.85  nvme 6.14
+PIPELINE_DONE
