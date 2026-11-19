@@ -11,7 +11,7 @@ pinned RAM tier, and streams the rest from NVMe on demand. Three constraints it 
 - **Compute:** all expert math runs on the GPUs.
 - **Parallelism:** tensor parallel across the two GPUs (TP2).
 
-It started from a 1 tok/s baseline and now decodes at 88–95 tok/s on code.
+It started from a 1 tok/s baseline and now decodes at 94–105 tok/s on code.
 
 > Built on [DeepSeek-V4.1-Flash-1017-lossless-CSF](https://huggingface.co/local-inference-lab/DeepSeek-V4.1-Flash-1017-lossless-CSF)
 > by Local Inference Lab, Inc. (Local Inference Lab License 1.0). Development and **every measurement
@@ -42,33 +42,37 @@ It started from a 1 tok/s baseline and now decodes at 88–95 tok/s on code.
 | Requirement | Detail |
 |---|---|
 | GPUs | 2× RTX PRO 6000 Blackwell, 96 GB each (sm_120). TP2 is the only supported layout. |
-| Host RAM | About 124 GiB, with nothing else heavy running. The engine pins about 77 GiB. |
+| Host RAM | About 124 GiB, with nothing else heavy running. The engine pins about 80 GiB. |
 | Storage | Two NVMe drives, about 150 GB free each for the expert pack. |
 | Runtime | Docker with the NVIDIA runtime (dev path), or Kubernetes with a 2-GPU claim (deploy path). |
 | Checkpoint | Downloaded separately; accept its license on Hugging Face. |
 | Time | About 8 minutes to build the pack; the image build compiles sm_120 extensions. |
 
-Not a fit if you have one GPU, no NVMe, or want more than about 92 tok/s of total throughput from
+Not a fit if you have one GPU, no NVMe, or want more than about 108 tok/s of total throughput from
 this hardware — see [Known limitations](#known-limitations).
 
 ## Results
 
 Measured on the target machine, idle server, single request unless noted. Final build: split pack +
-deterministic M16 kernel + progressive fill acknowledgement + per-layer slot counts + learned
-placement + 4,400-expert RAM tier + 4 sequences.
+deterministic M16 kernel + `io_uring` read engine + per-layer slot counts + cost-weighted learned
+placement + 4,600-expert RAM tier + DSpark with 4 draft tokens + 4 sequences.
 
 | | |
 |---|---|
-| Decode, code (T=0, thinking off) | 94–102 tok/s |
-| Decode, thinking mode (T=1) | 84–88 tok/s |
-| Decode, prose | 69–78 tok/s |
-| 4 concurrent requests | about 97 tok/s total, about 24 per stream, all starting within about 1 s |
-| Prefill, real source code, about 50k-token prompts | about 1,900 tok/s |
+| Decode, code (T=0, thinking off) | 94–105 tok/s |
+| Decode, thinking mode (T=1) | 80–81 tok/s |
+| Decode, prose | 62–74 tok/s |
+| 4 concurrent requests | about 108 tok/s total, about 27 per stream, all starting within about 1 s |
+| Prefill, real source code, about 50k-token prompts | about 1,970–2,000 tok/s |
 | Context | 1M tokens (2 GiB fp8 KV cache) |
 | Long-prompt recall (passphrase at 2k / 8k / 25k tokens) | exact |
 
-**Speculative decoding:** DSpark with 3 draft tokens and adaptive verification, at 2–3.4 tokens per
+**Speculative decoding:** DSpark with 4 draft tokens and adaptive verification, at 2–3.4 tokens per
 step depending on content.
+
+**Capability** (through the public gateway, greedy, thinking off, n=150): GSM8K 98.7%, MATH-500
+88.0%, HumanEval 98.0%, MMLU-Pro 83.6%. With thinking on (n=100): 96.0%, 82.0%, 95.0%, 88.8%.
+`evidence/capability/` holds every item's prompt, response and verdict, so a run can be re-graded.
 
 **Speed depends on content.** Prose and reasoning route to experts that are less often resident than
 code, and accept fewer draft tokens.
@@ -99,9 +103,10 @@ These steps assume a node that meets the requirements above.
 
    ```bash
    MODEL=<checkpoint snapshot> PACK_DIR1=<drive 1 dir> PACK_DIR2=<drive 2 dir> bash scripts/devctl.sh start
-   PACK_DIRS=/pack/nvme1/split:/pack/nvme2/split PLACEMENT=placement-learned-20261024.json \
-     RAM_EXPERTS=4400 HOST_CACHE=160 PREFETCH_WIDTH=0 SLOTS=208 MAX_BATCHED=4096 \
-     GRAPH_TOKENS=16 MAX_SEQS=4 CAPTURE=16 bash scripts/serve-v4.sh
+   PACK_DIRS=/pack/nvme1/split:/pack/nvme2/split PLACEMENT=placement-layered-cost-lru56-20261118.json \
+     RAM_EXPERTS=4600 HOST_CACHE=160 PREFETCH_WIDTH=0 SLOTS=208 MAX_BATCHED=4096 \
+     GRAPH_TOKENS=24 MAX_SEQS=4 CAPTURE=24 SPEC_ARGS="--mode dspark --draft-tokens 4" \
+     bash scripts/serve-v4.sh
    ```
 
    Optional: for Kubernetes, build `Dockerfile` from a clean checkout
@@ -146,8 +151,11 @@ These steps assume a node that meets the requirements above.
 
 > **Which placement you point at changes the slot layout.** With
 > `evidence/placement-learned-20261024.json` (no per-layer block) `SLOTS` sets a uniform count —
-> 208 in the example above. With `evidence/placement-layered-20261024.json` the file's own
-> `capacity` block wins and `SLOTS` is ignored: 128–304 per layer, 8,320 in total either way.
+> 208 in the example above. With a per-layer file such as
+> `evidence/placement-layered-cost-lru56-20261118.json` (the deployed one) the file's own
+> `capacity` block wins and `SLOTS` is ignored: 152–280 per layer, 8,320 in total either way.
+> `evidence/placement-layered-cost-20261118.json` is the same learning at lru 28 (152–288 per
+> layer); it replays better and prefills faster, but cost about 20% on prose.
 
 ## Settings that matter
 
@@ -160,11 +168,11 @@ the example manifest overrides several of them.
 | `CSF_PACK_DIRS` | — | One pack directory per TP rank, colon-separated. |
 | `CSF_PLACEMENT` | — | Placement JSON from `evidence/`. A `capacity` block overrides `CSF_STREAM_SLOTS`. |
 | `CSF_STREAM_SLOTS` | 128 | VRAM expert slots per layer and rank. 216 does not leave room for 4,096-token prefill activations; 208 does. |
-| `CSF_RAM_EXPERTS` | all in placement | Pinned RAM-tier records per rank. 4,400 is about 77 GiB of host RAM across both ranks. |
+| `CSF_RAM_EXPERTS` | all in placement | Pinned RAM-tier records per rank. 4,600 is about 80 GiB of host RAM across both ranks. |
 | `CSF_HOST_CACHE` | 128 | Read-ahead buffers, 9.4 MB each. Prefill reads the next expert group ahead. |
-| `CSF_GRAPH_TOKENS` | 8 | Token capacity of one decode graph. 16 covers 4 sequences × (1 + 3 draft tokens). |
+| `CSF_GRAPH_TOKENS` | 8 | Token capacity of one decode graph. 24 covers 4 sequences × (1 + 4 draft tokens) with headroom. |
 | `CSF_MOE_KERNEL` | `auto` | `m16` forces the deterministic kernel. Split packs force it regardless. |
-| `CSF_PREFETCH_WIDTH` | 6 | Next-layer decode prefetch from router votes. **Measured slower: 0 gives 82–83 tok/s versus 73–77 at width 6.** |
+| `CSF_PREFETCH_WIDTH` | 6 | Next-layer decode prefetch from router votes. **Measured slower on the pre-`io_uring` engine (0 gave 82–83 tok/s versus 73–77 at width 6); with the new read classes it is neutral, so the deployed config sets 0.** |
 | `CSF_PREFILL_PREFETCH` | 1 | Prefill read-ahead from next-layer votes. Measured slower at every vote threshold; the example manifest sets 0. |
 | `CSF_EXPERT_MAJOR_PREFILL` | 1 | Load each distinct expert at most once per layer per chunk. |
 | `CSF_READ_CHUNKS` | 1 | Split a request's **only** NVMe read into N parallel 4 KiB-aligned chunks. See below. |
@@ -172,7 +180,7 @@ the example manifest overrides several of them.
 | `CSF_V4_TRACE` | — | Write routing ids (no text) to this path for `scripts/learn_placement.py`. |
 | `CSF_STREAM_METRICS_DIR` | — | Write per-layer counters here. |
 
-### `CSF_READ_CHUNKS` (newest change)
+### `CSF_READ_CHUNKS`
 
 A request whose only NVMe read is a demand miss can split that read into parallel chunks; a buffer
 becomes ready when its last chunk lands. `fio` on a real pack file, `O_DIRECT` + `io_uring`:
@@ -192,8 +200,8 @@ engine checks at startup.
 
 ## How it works
 
-Per routed layer and TP rank there are three tiers: **VRAM** slots (128–304 per layer, 8,320 total),
-a **pinned RAM tier** (4,400 records per rank), and an **NVMe pack** (one 9.4 MB record per expert and
+Per routed layer and TP rank there are three tiers: **VRAM** slots (152–280 per layer, 8,320 total),
+a **pinned RAM tier** (4,600 records per rank), and an **NVMe pack** (one 9.4 MB record per expert and
 rank, stored in B12X's prepared slot layout, so a miss is a byte copy and never a repack).
 
 ```
@@ -205,22 +213,28 @@ rank, stored in B12X's prepared slot layout, so a miss is a byte copy and never 
         host-mapped mailbox ──► C++ service thread ───┘
                                   (no CUDA calls, no GIL)
                                   ├─ hit  ─► pinned RAM tier
-                                  └─ miss ─► NVMe pack, O_DIRECT, 12 readers
+                                  └─ miss ─► NVMe pack, O_DIRECT, io_uring
 ```
 
 - **Inside the graph:** `publish` maps routed expert ids to slots and posts misses to host-mapped
   memory. `wait_fill` copies each record from pinned host memory into VRAM as soon as the host marks
   it ready, so RAM-tier records copy while NVMe reads are still in flight. `finalize` installs the
   slot table.
-- **On the host:** a C++ service thread runs the slot policy and issues `O_DIRECT` reads with 12
-  reader threads, demand before read-ahead. It never calls CUDA and never takes the GIL.
+- **On the host:** a C++ service thread runs the slot policy and issues `O_DIRECT` reads through one
+  `io_uring` thread, with the host cache registered as fixed buffers (`CSF_NO_URING=1` falls back to
+  `pread` threads). Reads are classed: demand first, then bulk prefill read-ahead, then decode
+  predictions split into small pieces that reach the drive only while nothing else is in flight. A
+  demand for a record still being read ahead promotes its queued pieces, and NVMe fills are
+  acknowledged in completion order. It never calls CUDA and never takes the GIL.
 - **Expert math:** each rank's expert slice is stored as **two half-width experts** and runs through
   B12X's **deterministic** MoE kernel. The default small-batch kernel is not reproducible at the full
   TP2 width, and it put stray tokens into greedy code output.
-- **Prefill is expert-major:** each layer loads every distinct expert at most once per chunk, in
-  groups that fit the free slots. Each group runs only its own (token, route) pairs while the next
-  group is read ahead.
-- **Concurrency:** up to 4 sequences in 16-token CUDA graphs. A step that needs more free slots than
+- **Prefill is expert-major:** each layer loads every distinct expert at most once per chunk.
+  Group 0 is every already-resident expert and runs as one dense pass, so the misses that follow
+  cannot evict it; the misses then come in groups that fit the free slots, each running only its own
+  (token, route) pairs while the next group is read ahead. The last group of a layer also reads ahead
+  the next layer's experts from the previous chunk.
+- **Concurrency:** up to 4 sequences in 24-token CUDA graphs. A step that needs more free slots than
   the LRU holds borrows the least recently used pinned slot.
 
 ## Glossary
@@ -239,7 +253,7 @@ lossless scale compression. **DSpark** — the speculative decoding scheme. **En
 | Process exits mid-generation | In-graph spin exceeded `CSF_WAIT_TIMEOUT_S` (60 s) | Check NVMe saturation and host RAM; the service exits deliberately so a supervisor restarts it. |
 | OOM at startup with long prefill | `CSF_STREAM_SLOTS=216` leaves no room for 4,096-token activations | Use 208. |
 | Container fails at startup, Engram or io_uring errors | `seccompProfile: Unconfined`, `IPC_LOCK`, and `ulimit -l unlimited` are all required | See the example manifest. |
-| Host OOM kill | RAM tier plus everything else exceeds the machine | Lower `CSF_RAM_EXPERTS` or free the node; 13 GiB was left available at 4,400. |
+| Host OOM kill | RAM tier plus everything else exceeds the machine | Lower `CSF_RAM_EXPERTS` or free the node; 13 GiB was left available at 4,400, so 4,600 leaves less. |
 | Prefill looks far below the numbers here | Random-word prompts touch nearly every expert and overstate prefill several-fold | Measure on real source code. |
 
 ## Repository layout
@@ -247,7 +261,7 @@ lossless scale compression. **DSpark** — the speculative decoding scheme. **En
 | Path | What |
 |---|---|
 | `csf_streaming/fastcache.py` | Slot cache, RAM tier, pack reader, split-pack MoE calls (`run_slots`, `run_pairs`), prefill groups |
-| `csf_streaming/csrc/v4.cu` | `wait_fill` / `finalize` kernels and the C++ host service (slot policy, soft pinning, `O_DIRECT` readers) |
+| `csf_streaming/csrc/v4.cu` | `wait_fill` / `finalize` kernels and the C++ host service (slot policy, soft pinning, `io_uring` reader) |
 | `csf_streaming/csrc/mailbox.cu` | `publish` kernel and host-mapped mailbox helpers |
 | `csf_streaming/integration.py` | Replaces vLLM's MXFP4-CSF MoE method for the 40 routed layers (DSpark draft layers stay resident) |
 | `csf_streaming/storage.py` | CSF reads, B12X weight preparation, slot allocation |
@@ -257,9 +271,10 @@ lossless scale compression. **DSpark** — the speculative decoding scheme. **En
 | `vendor/deepseek_v41_encoding_1017.py` | DeepSeek's 1017 chat encoder (MIT, unchanged), needed for tool calls |
 | `Dockerfile` | Pinned Local Inference Lab vLLM image + this code + prebuilt sm_120 extensions |
 | `deploy/k8s/statefulset.example.yaml` | Example Kubernetes deployment with every engine setting explained |
+| `docs/visuals/` | A self-contained HTML explainer of how the model fits on this machine, written for a non-technical reader |
 | `scripts/` | Pack builder, server scripts, and correctness and benchmark tools (below) |
 | `bench/` | Dev-server helpers (restart, exact reference, logprob matrix) |
-| `evidence/` | Placements, the junk-token investigation outputs, logprob run logs, v1 validation records |
+| `evidence/` | Placements, the junk-token investigation outputs, logprob run logs, v1 validation records, capability benchmark runs |
 
 ## Tools
 
@@ -274,6 +289,7 @@ lossless scale compression. **DSpark** — the speculative decoding scheme. **En
 | `scripts/kernel_race.py`, `scripts/decode_cfgs.py`, `scripts/split_check.py` | MoE kernel reproducibility, speed, and split-layout checks |
 | `scripts/logprob_eval.py` | Teacher-forced next-token distributions; compares engines position by position |
 | `scripts/test_mailbox.py`, `scripts/test_mailbox_sync.py` | Mailbox handshake, with and without the model |
+| `scripts/v4_host_check.py` | Drives the host service with no GPU: fake packs and mailboxes, real `O_DIRECT` reads; byte-checks every fill and the read-ahead hint encoding |
 | `scripts/imgtest.py` | Image input end to end |
 
 **Speed and behaviour**
@@ -285,6 +301,7 @@ lossless scale compression. **DSpark** — the speculative decoding scheme. **En
 | `scripts/decode_mix.py`, `scripts/decode_speed.py`, `scripts/concurrency.py` | Decode speed by content type and concurrency |
 | `scripts/long_context.py`, `scripts/long_decode.py` | Speed at long context; decode after a long real-code prompt |
 | `scripts/agent_benchmark.py` | Tool-using coding sessions in networkless containers; wall time and pass rate |
+| `scripts/capability_eval.py` | GSM8K, MATH-500, HumanEval and MMLU-Pro through the public gateway; writes re-gradable JSON |
 | `scripts/bench_fill.py`, `scripts/bench_moe_kernel.py` | GPU fill bandwidth; one layer's MoE kernel in isolation |
 | `scripts/read_bench.py` | `O_DIRECT` read latency of expert records, whole versus chunked |
 
@@ -296,6 +313,7 @@ lossless scale compression. **DSpark** — the speculative decoding scheme. **En
 | `scripts/layer_budget.py` | Chooses per-layer slot counts at a fixed total by replaying held-out decode traffic |
 | `scripts/simulate_cache.py` | Replays a trace against VRAM/RAM/SSD tiers and reports implied transfer time |
 | `scripts/predict_eval.py` | Measures how well layer L's MoE input predicts the experts of layers L+d |
+| `scripts/cooccur_eval.py` | Cross-layer co-occurrence prefetch rules; measured 17% precision at 19% recall, so rejected |
 
 The server records routing ids (no text) to `CSF_V4_TRACE` when it is set;
 `scripts/learn_placement.py` reads those files.
@@ -320,9 +338,9 @@ The GPU-side checks are the `validate_*` scripts above; they need a checkpoint a
   the sparse-attention top-k fallback, all-reduce).
 - **No comparison against an independent implementation** of the same checkpoint, and the abliterated
   model's own quality cost against the original weights is unmeasured.
-- **Prefill gap:** about 1.8k tok/s against a 4k target.
-- **Throughput is flat with concurrency.** More streams remove queueing; they do not reduce the
-  per-step cost, which is bound by expert streaming.
+- **Prefill gap:** about 2.0k tok/s against a 4k target.
+- **Throughput is nearly flat with concurrency.** More streams remove queueing; they do not reduce
+  the per-step cost, which is bound by expert streaming.
 
 [docs/DESIGN.md §8](docs/DESIGN.md) has the full list with the reasoning.
 
